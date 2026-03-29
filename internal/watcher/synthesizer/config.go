@@ -160,6 +160,9 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 		if ck.BaseURL != "" {
 			attrs["base_url"] = ck.BaseURL
 		}
+		if denoHost := strings.TrimSpace(ck.DenoProxyHost); denoHost != "" {
+			attrs["deno_proxy_host"] = denoHost
+		}
 		if ck.Websockets {
 			attrs["websockets"] = "true"
 		}

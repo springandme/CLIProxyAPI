@@ -158,6 +158,15 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		}
 	}
 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")
+	if rawDenoHost, ok := metadata["deno_proxy_host"]; ok {
+		if denoHost := strings.TrimSpace(fmt.Sprint(rawDenoHost)); denoHost != "" {
+			a.Attributes["deno_proxy_host"] = denoHost
+		}
+	} else if rawDenoHost, ok := metadata["deno-proxy-host"]; ok {
+		if denoHost := strings.TrimSpace(fmt.Sprint(rawDenoHost)); denoHost != "" {
+			a.Attributes["deno_proxy_host"] = denoHost
+		}
+	}
 	// For codex auth files, extract plan_type from the JWT id_token.
 	if provider == "codex" {
 		if idTokenRaw, ok := metadata["id_token"].(string); ok && strings.TrimSpace(idTokenRaw) != "" {

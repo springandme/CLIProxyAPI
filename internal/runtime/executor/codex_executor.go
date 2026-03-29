@@ -28,8 +28,10 @@ import (
 )
 
 const (
-	codexUserAgent  = "codex_cli_rs/0.116.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
-	codexOriginator = "codex_cli_rs"
+	codexUserAgent       = "codex_cli_rs/0.116.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
+	codexOriginator      = "codex_cli_rs"
+	codexDefaultBaseURL  = "https://chatgpt.com/backend-api/codex"
+	codexDenoProxyPrefix = "/codex"
 )
 
 var dataTag = []byte("data:")
@@ -43,6 +45,89 @@ type CodexExecutor struct {
 func NewCodexExecutor(cfg *config.Config) *CodexExecutor { return &CodexExecutor{cfg: cfg} }
 
 func (e *CodexExecutor) Identifier() string { return "codex" }
+
+func codexDenoProxyHost(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	read := func(values map[string]string) string {
+		if len(values) == 0 {
+			return ""
+		}
+		return strings.TrimSpace(values["deno_proxy_host"])
+	}
+	if denoHost := read(auth.Attributes); denoHost != "" {
+		return normalizeCodexDenoProxyHost(denoHost)
+	}
+	if auth.Metadata != nil {
+		if raw, ok := auth.Metadata["deno_proxy_host"].(string); ok {
+			return normalizeCodexDenoProxyHost(raw)
+		}
+		if raw, ok := auth.Metadata["deno-proxy-host"].(string); ok {
+			return normalizeCodexDenoProxyHost(raw)
+		}
+	}
+	return ""
+}
+
+func normalizeCodexDenoProxyHost(raw string) string {
+	denoHost := strings.TrimSpace(raw)
+	if denoHost == "" {
+		return ""
+	}
+	if !strings.HasPrefix(denoHost, "http://") && !strings.HasPrefix(denoHost, "https://") {
+		denoHost = "https://" + denoHost
+	}
+	return strings.TrimSuffix(denoHost, "/")
+}
+
+func codexUsesDenoProxy(auth *cliproxyauth.Auth) bool {
+	return codexDenoProxyHost(auth) != ""
+}
+
+func applyCodexDenoProxy(auth *cliproxyauth.Auth, targetURL string) string {
+	denoHost := codexDenoProxyHost(auth)
+	if denoHost == "" {
+		return targetURL
+	}
+
+	normalizedTarget := strings.TrimSpace(targetURL)
+	if normalizedTarget == "" {
+		return targetURL
+	}
+
+	prefix := strings.TrimSuffix(codexDefaultBaseURL, "/")
+	if !strings.HasPrefix(normalizedTarget, prefix) {
+		return targetURL
+	}
+
+	suffix := strings.TrimPrefix(normalizedTarget, prefix)
+	proxyURL := denoHost + codexDenoProxyPrefix + suffix
+
+	authID := ""
+	if auth != nil {
+		authID = strings.TrimSpace(auth.ID)
+	}
+	log.Infof("codex deno proxy: forwarding request [auth=%s] from %s -> %s", authID, normalizedTarget, proxyURL)
+	return proxyURL
+}
+
+func rewriteCodexHTTPRequestForDeno(auth *cliproxyauth.Auth, req *http.Request) error {
+	if req == nil || req.URL == nil {
+		return nil
+	}
+	rewritten := applyCodexDenoProxy(auth, req.URL.String())
+	if rewritten == req.URL.String() {
+		return nil
+	}
+	parsed, err := http.NewRequestWithContext(req.Context(), req.Method, rewritten, nil)
+	if err != nil {
+		return err
+	}
+	req.URL = parsed.URL
+	req.Host = ""
+	return nil
+}
 
 // PrepareRequest injects Codex credentials into the outgoing HTTP request.
 func (e *CodexExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
@@ -73,6 +158,9 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
+	if err := rewriteCodexHTTPRequestForDeno(auth, httpReq); err != nil {
+		return nil, err
+	}
 	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	return httpClient.Do(httpReq)
 }
@@ -85,7 +173,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 
 	apiKey, baseURL := codexCreds(auth)
 	if baseURL == "" {
-		baseURL = "https://chatgpt.com/backend-api/codex"
+		baseURL = codexDefaultBaseURL
 	}
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
@@ -117,7 +205,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		body, _ = sjson.SetBytes(body, "instructions", "")
 	}
 
-	url := strings.TrimSuffix(baseURL, "/") + "/responses"
+	url := applyCodexDenoProxy(auth, strings.TrimSuffix(baseURL, "/")+"/responses")
 	httpReq, continuity, err := e.cacheHelper(ctx, auth, from, url, req, opts, body)
 	if err != nil {
 		return resp, err
@@ -196,7 +284,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 
 	apiKey, baseURL := codexCreds(auth)
 	if baseURL == "" {
-		baseURL = "https://chatgpt.com/backend-api/codex"
+		baseURL = codexDefaultBaseURL
 	}
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
@@ -222,7 +310,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.DeleteBytes(body, "stream")
 
-	url := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
+	url := applyCodexDenoProxy(auth, strings.TrimSuffix(baseURL, "/")+"/responses/compact")
 	httpReq, continuity, err := e.cacheHelper(ctx, auth, from, url, req, opts, body)
 	if err != nil {
 		return resp, err
@@ -287,7 +375,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 	apiKey, baseURL := codexCreds(auth)
 	if baseURL == "" {
-		baseURL = "https://chatgpt.com/backend-api/codex"
+		baseURL = codexDefaultBaseURL
 	}
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
@@ -318,7 +406,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		body, _ = sjson.SetBytes(body, "instructions", "")
 	}
 
-	url := strings.TrimSuffix(baseURL, "/") + "/responses"
+	url := applyCodexDenoProxy(auth, strings.TrimSuffix(baseURL, "/")+"/responses")
 	httpReq, continuity, err := e.cacheHelper(ctx, auth, from, url, req, opts, body)
 	if err != nil {
 		return nil, err

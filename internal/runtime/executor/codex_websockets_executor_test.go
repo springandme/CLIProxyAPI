@@ -259,6 +259,24 @@ func TestApplyCodexHeadersUsesConfigUserAgentForOAuth(t *testing.T) {
 	}
 }
 
+func TestCodexWebsocketsEnabled_DisabledWhenDenoProxyConfigured(t *testing.T) {
+	attrAuth := &cliproxyauth.Auth{
+		Provider:   "codex",
+		Attributes: map[string]string{"websockets": "true", "deno_proxy_host": "https://relay.example.com"},
+	}
+	if codexWebsocketsEnabled(attrAuth) {
+		t.Fatal("expected websocket transport to be disabled when deno proxy host is configured in attributes")
+	}
+
+	metaAuth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Metadata: map[string]any{"websockets": true, "deno_proxy_host": "https://relay.example.com"},
+	}
+	if codexWebsocketsEnabled(metaAuth) {
+		t.Fatal("expected websocket transport to be disabled when deno proxy host is configured in metadata")
+	}
+}
+
 func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
 	if err != nil {

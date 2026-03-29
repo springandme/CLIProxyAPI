@@ -181,6 +181,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			if strings.TrimSpace(o.BaseURL) != strings.TrimSpace(n.BaseURL) {
 				changes = append(changes, fmt.Sprintf("codex[%d].base-url: %s -> %s", i, strings.TrimSpace(o.BaseURL), strings.TrimSpace(n.BaseURL)))
 			}
+			if strings.TrimSpace(o.DenoProxyHost) != strings.TrimSpace(n.DenoProxyHost) {
+				changes = append(changes, fmt.Sprintf("codex[%d].deno-proxy-host: %s -> %s", i, strings.TrimSpace(o.DenoProxyHost), strings.TrimSpace(n.DenoProxyHost)))
+			}
 			if strings.TrimSpace(o.ProxyURL) != strings.TrimSpace(n.ProxyURL) {
 				changes = append(changes, fmt.Sprintf("codex[%d].proxy-url: %s -> %s", i, formatProxyURL(o.ProxyURL), formatProxyURL(n.ProxyURL)))
 			}

@@ -847,6 +847,7 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 		APIKey         *string              `json:"api-key"`
 		Prefix         *string              `json:"prefix"`
 		BaseURL        *string              `json:"base-url"`
+		DenoProxyHost  *string              `json:"deno-proxy-host"`
 		ProxyURL       *string              `json:"proxy-url"`
 		Models         *[]config.CodexModel `json:"models"`
 		Headers        *map[string]string   `json:"headers"`
@@ -895,6 +896,9 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 			return
 		}
 		entry.BaseURL = trimmed
+	}
+	if body.Value.DenoProxyHost != nil {
+		entry.DenoProxyHost = strings.TrimSpace(*body.Value.DenoProxyHost)
 	}
 	if body.Value.ProxyURL != nil {
 		entry.ProxyURL = strings.TrimSpace(*body.Value.ProxyURL)
@@ -1005,6 +1009,7 @@ func normalizeCodexKey(entry *config.CodexKey) {
 	entry.APIKey = strings.TrimSpace(entry.APIKey)
 	entry.Prefix = strings.TrimSpace(entry.Prefix)
 	entry.BaseURL = strings.TrimSpace(entry.BaseURL)
+	entry.DenoProxyHost = strings.TrimSpace(entry.DenoProxyHost)
 	entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
 	entry.Headers = config.NormalizeHeaders(entry.Headers)
 	entry.ExcludedModels = config.NormalizeExcludedModels(entry.ExcludedModels)

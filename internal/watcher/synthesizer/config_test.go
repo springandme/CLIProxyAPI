@@ -231,11 +231,12 @@ func TestConfigSynthesizer_CodexKeys(t *testing.T) {
 		Config: &config.Config{
 			CodexKey: []config.CodexKey{
 				{
-					APIKey:     "codex-key-123",
-					Prefix:     "dev",
-					BaseURL:    "https://api.openai.com",
-					ProxyURL:   "http://proxy.local",
-					Websockets: true,
+					APIKey:        "codex-key-123",
+					Prefix:        "dev",
+					BaseURL:       "https://api.openai.com",
+					DenoProxyHost: "https://codex-deno.example.com",
+					ProxyURL:      "http://proxy.local",
+					Websockets:    true,
 				},
 			},
 		},
@@ -262,6 +263,9 @@ func TestConfigSynthesizer_CodexKeys(t *testing.T) {
 	}
 	if auths[0].Attributes["websockets"] != "true" {
 		t.Errorf("expected websockets=true, got %s", auths[0].Attributes["websockets"])
+	}
+	if auths[0].Attributes["deno_proxy_host"] != "https://codex-deno.example.com" {
+		t.Errorf("expected deno_proxy_host to be synthesized, got %s", auths[0].Attributes["deno_proxy_host"])
 	}
 }
 
