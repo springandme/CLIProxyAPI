@@ -2,32 +2,14 @@ import { serve } from "https://deno.land/std/http/server.ts";
 
 const CODEX_PREFIX = "/codex";
 const CODEX_UPSTREAM = "https://chatgpt.com/backend-api/codex";
-
-const FORWARD_REQUEST_HEADERS = new Set([
-  "accept",
-  "accept-encoding",
-  "accept-language",
-  "authorization",
-  "content-type",
-  "cookie",
-  "origin",
-  "originator",
-  "referer",
-  "session_id",
-  "user-agent",
-  "version",
-  "x-client-request-id",
-  "x-codex-turn-metadata",
-  "x-codex-turn-state",
-  "x-openai-client-id",
-  "x-openai-client-version",
-  "x-responsesapi-include-timing-metrics",
-]);
+const DEFAULT_USER_AGENT =
+  "codex_cli_rs/0.116.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464";
+const WEBSOCKET_OPEN_TIMEOUT_MS = 15_000;
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
-  "content-length",
   "content-encoding",
+  "content-length",
   "keep-alive",
   "proxy-authenticate",
   "proxy-authorization",
@@ -36,9 +18,6 @@ const HOP_BY_HOP_HEADERS = new Set([
   "transfer-encoding",
   "upgrade",
 ]);
-
-const DEFAULT_USER_AGENT =
-  "codex_cli_rs/0.116.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464";
 
 serve(async (request) => {
   const url = new URL(request.url);
@@ -63,51 +42,300 @@ serve(async (request) => {
   }
 
   const suffix = pathname.slice(CODEX_PREFIX.length) || "/";
-  const targetUrl = `${CODEX_UPSTREAM}${suffix}${url.search}`;
+  const targetHttpUrl = `${CODEX_UPSTREAM}${suffix}${url.search}`;
 
   try {
-    const upstreamHeaders = new Headers();
-    for (const [key, value] of request.headers.entries()) {
-      const lower = key.toLowerCase();
-      if (FORWARD_REQUEST_HEADERS.has(lower) && !HOP_BY_HOP_HEADERS.has(lower)) {
-        upstreamHeaders.set(key, value);
-      }
+    if (isWebSocketUpgrade(request)) {
+      return await handleWebSocketRelay(request, targetHttpUrl);
     }
-
-    upstreamHeaders.set("Host", new URL(CODEX_UPSTREAM).host);
-    if (!upstreamHeaders.has("User-Agent") && !upstreamHeaders.has("user-agent")) {
-      upstreamHeaders.set("User-Agent", DEFAULT_USER_AGENT);
-    }
-
-    const response = await fetch(targetUrl, {
-      method: request.method,
-      headers: upstreamHeaders,
-      body: request.body,
-      redirect: "manual",
-    });
-
-    const responseHeaders = new Headers();
-    for (const [key, value] of response.headers.entries()) {
-      const lower = key.toLowerCase();
-      if (HOP_BY_HOP_HEADERS.has(lower)) {
-        continue;
-      }
-      responseHeaders.set(key, value);
-    }
-
-    responseHeaders.set("X-Content-Type-Options", "nosniff");
-    responseHeaders.set("X-Frame-Options", "DENY");
-    responseHeaders.set("Referrer-Policy", "no-referrer");
-
-    return new Response(response.body, {
-      status: response.status,
-      headers: responseHeaders,
-    });
+    return await handleHttpRelay(request, targetHttpUrl);
   } catch (error) {
     console.error("Codex proxy error:", error);
-    return new Response(JSON.stringify({ error: "Internal Server Error" }), {
-      status: 500,
-      headers: { "Content-Type": "application/json; charset=utf-8" },
-    });
+    return jsonError(500, "Internal Server Error");
   }
 });
+
+async function handleHttpRelay(
+  request: Request,
+  targetUrl: string,
+): Promise<Response> {
+  const upstreamHeaders = buildUpstreamHeaders(request, targetUrl, false);
+  const body = bodyAllowed(request.method) ? request.body : undefined;
+
+  const response = await fetch(targetUrl, {
+    method: request.method,
+    headers: upstreamHeaders,
+    body,
+    redirect: "manual",
+    ...(body ? { duplex: "half" as const } : {}),
+  });
+
+  return buildProxyResponse(response);
+}
+
+async function handleWebSocketRelay(
+  request: Request,
+  targetHttpUrl: string,
+): Promise<Response> {
+  const targetWsUrl = toWebSocketUrl(targetHttpUrl);
+  const upstreamHeaders = buildUpstreamHeaders(request, targetHttpUrl, true);
+  const { socket: downstreamSocket, response } = Deno.upgradeWebSocket(request);
+  downstreamSocket.binaryType = "arraybuffer";
+
+  const upstreamSocket = new WebSocket(targetWsUrl, {
+    headers: upstreamHeaders,
+  });
+  upstreamSocket.binaryType = "arraybuffer";
+
+  const openResult = await waitForWebSocketOpen(upstreamSocket, targetWsUrl);
+  if (!openResult.ok) {
+    safeCloseSocket(upstreamSocket, 1011, openResult.message);
+    return jsonError(openResult.status, openResult.message);
+  }
+
+  wireWebSocketRelay(downstreamSocket, upstreamSocket);
+  return response;
+}
+
+function buildUpstreamHeaders(
+  request: Request,
+  targetUrl: string,
+  websocket: boolean,
+): Headers {
+  const headers = new Headers();
+
+  for (const [key, value] of request.headers.entries()) {
+    const lower = key.toLowerCase();
+    if (shouldSkipRequestHeader(lower)) {
+      continue;
+    }
+    headers.set(key, value);
+  }
+
+  if (!websocket) {
+    headers.set("Host", new URL(targetUrl).host);
+  }
+  if (!headers.has("User-Agent") && !headers.has("user-agent")) {
+    headers.set("User-Agent", DEFAULT_USER_AGENT);
+  }
+
+  return headers;
+}
+
+function shouldSkipRequestHeader(lower: string): boolean {
+  if (lower === "host" || HOP_BY_HOP_HEADERS.has(lower)) {
+    return true;
+  }
+  return lower.startsWith("sec-websocket-");
+}
+
+function buildProxyResponse(response: Response): Response {
+  const responseHeaders = new Headers();
+
+  for (const [key, value] of response.headers.entries()) {
+    const lower = key.toLowerCase();
+    if (HOP_BY_HOP_HEADERS.has(lower)) {
+      continue;
+    }
+    responseHeaders.set(key, value);
+  }
+
+  responseHeaders.set("X-Content-Type-Options", "nosniff");
+  responseHeaders.set("X-Frame-Options", "DENY");
+  responseHeaders.set("Referrer-Policy", "no-referrer");
+
+  return new Response(response.body, {
+    status: response.status,
+    headers: responseHeaders,
+  });
+}
+
+function wireWebSocketRelay(
+  downstreamSocket: WebSocket,
+  upstreamSocket: WebSocket,
+) {
+  downstreamSocket.addEventListener("message", (event) => {
+    void relayWebSocketMessage(
+      "downstream->upstream",
+      event.data,
+      upstreamSocket,
+      downstreamSocket,
+    );
+  });
+  upstreamSocket.addEventListener("message", (event) => {
+    void relayWebSocketMessage(
+      "upstream->downstream",
+      event.data,
+      downstreamSocket,
+      upstreamSocket,
+    );
+  });
+
+  downstreamSocket.addEventListener("close", (event) => {
+    safeCloseSocket(
+      upstreamSocket,
+      sanitizeCloseCode(event.code),
+      event.reason,
+    );
+  });
+  upstreamSocket.addEventListener("close", (event) => {
+    safeCloseSocket(
+      downstreamSocket,
+      sanitizeCloseCode(event.code),
+      event.reason,
+    );
+  });
+
+  downstreamSocket.addEventListener("error", () => {
+    safeCloseSocket(upstreamSocket, 1011, "Downstream websocket error");
+  });
+  upstreamSocket.addEventListener("error", () => {
+    safeCloseSocket(downstreamSocket, 1011, "Upstream websocket error");
+  });
+}
+
+async function relayWebSocketMessage(
+  direction: string,
+  data: Blob | ArrayBuffer | ArrayBufferView | string,
+  targetSocket: WebSocket,
+  peerSocket: WebSocket,
+) {
+  if (targetSocket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+
+  try {
+    targetSocket.send(await normalizeWebSocketData(data));
+  } catch (error) {
+    console.error(`Codex websocket relay send error (${direction}):`, error);
+    safeCloseSocket(targetSocket, 1011, "Relay send failure");
+    safeCloseSocket(peerSocket, 1011, "Relay send failure");
+  }
+}
+
+async function normalizeWebSocketData(
+  data: Blob | ArrayBuffer | ArrayBufferView | string,
+): Promise<ArrayBuffer | ArrayBufferView | string> {
+  if (typeof data === "string") {
+    return data;
+  }
+  if (data instanceof Blob) {
+    return await data.arrayBuffer();
+  }
+  return data;
+}
+
+async function waitForWebSocketOpen(
+  socket: WebSocket,
+  targetUrl: string,
+): Promise<{ ok: true } | { ok: false; status: number; message: string }> {
+  return await new Promise((resolve) => {
+    let settled = false;
+    const timeout = setTimeout(() => {
+      settle({
+        ok: false,
+        status: 504,
+        message: `Timed out connecting to upstream websocket: ${targetUrl}`,
+      });
+    }, WEBSOCKET_OPEN_TIMEOUT_MS);
+
+    const cleanup = () => {
+      clearTimeout(timeout);
+      socket.removeEventListener("open", onOpen);
+      socket.removeEventListener("error", onError);
+      socket.removeEventListener("close", onClose);
+    };
+
+    const settle = (
+      result: { ok: true } | { ok: false; status: number; message: string },
+    ) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve(result);
+    };
+
+    const onOpen = () => settle({ ok: true });
+    const onError = () =>
+      settle({
+        ok: false,
+        status: 502,
+        message: `Failed to connect to upstream websocket: ${targetUrl}`,
+      });
+    const onClose = (event: CloseEvent) =>
+      settle({
+        ok: false,
+        status: 502,
+        message: formatCloseMessage(
+          "Upstream websocket closed before relay was ready",
+          event,
+        ),
+      });
+
+    socket.addEventListener("open", onOpen);
+    socket.addEventListener("error", onError);
+    socket.addEventListener("close", onClose);
+  });
+}
+
+function formatCloseMessage(prefix: string, event: CloseEvent): string {
+  const reason = event.reason ? `: ${event.reason}` : "";
+  return `${prefix} (code=${event.code}${reason})`;
+}
+
+function safeCloseSocket(socket: WebSocket, code: number, reason: string) {
+  if (
+    socket.readyState !== WebSocket.OPEN &&
+    socket.readyState !== WebSocket.CONNECTING
+  ) {
+    return;
+  }
+
+  try {
+    socket.close(sanitizeCloseCode(code), sanitizeCloseReason(reason));
+  } catch (error) {
+    console.error("Codex websocket relay close error:", error);
+  }
+}
+
+function sanitizeCloseCode(code: number): number {
+  if (!Number.isInteger(code) || code < 1000 || code >= 5000) {
+    return 1011;
+  }
+  if (code === 1005 || code === 1006 || code === 1015) {
+    return 1011;
+  }
+  return code;
+}
+
+function sanitizeCloseReason(reason: string): string {
+  const normalized = String(reason ?? "").trim();
+  if (!normalized) {
+    return "";
+  }
+  return normalized.slice(0, 120);
+}
+
+function isWebSocketUpgrade(request: Request): boolean {
+  return request.headers.get("upgrade")?.toLowerCase() === "websocket";
+}
+
+function bodyAllowed(method: string): boolean {
+  const normalized = method.toUpperCase();
+  return normalized !== "GET" && normalized !== "HEAD";
+}
+
+function toWebSocketUrl(httpUrl: string): string {
+  const target = new URL(httpUrl);
+  target.protocol = target.protocol === "https:" ? "wss:" : "ws:";
+  return target.toString();
+}
+
+function jsonError(status: number, message: string): Response {
+  return new Response(JSON.stringify({ error: message }), {
+    status,
+    headers: { "Content-Type": "application/json; charset=utf-8" },
+  });
+}

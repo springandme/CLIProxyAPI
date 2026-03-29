@@ -259,21 +259,29 @@ func TestApplyCodexHeadersUsesConfigUserAgentForOAuth(t *testing.T) {
 	}
 }
 
-func TestCodexWebsocketsEnabled_DisabledWhenDenoProxyConfigured(t *testing.T) {
+func TestCodexWebsocketsEnabled_HonorsConfiguredValueWhenDenoProxyConfigured(t *testing.T) {
 	attrAuth := &cliproxyauth.Auth{
 		Provider:   "codex",
 		Attributes: map[string]string{"websockets": "true", "deno_proxy_host": "https://relay.example.com"},
 	}
-	if codexWebsocketsEnabled(attrAuth) {
-		t.Fatal("expected websocket transport to be disabled when deno proxy host is configured in attributes")
+	if !codexWebsocketsEnabled(attrAuth) {
+		t.Fatal("expected websocket transport to stay enabled when websockets=true is configured in attributes")
 	}
 
 	metaAuth := &cliproxyauth.Auth{
 		Provider: "codex",
 		Metadata: map[string]any{"websockets": true, "deno_proxy_host": "https://relay.example.com"},
 	}
-	if codexWebsocketsEnabled(metaAuth) {
-		t.Fatal("expected websocket transport to be disabled when deno proxy host is configured in metadata")
+	if !codexWebsocketsEnabled(metaAuth) {
+		t.Fatal("expected websocket transport to stay enabled when websockets=true is configured in metadata")
+	}
+
+	disabledAuth := &cliproxyauth.Auth{
+		Provider:   "codex",
+		Attributes: map[string]string{"websockets": "false", "deno_proxy_host": "https://relay.example.com"},
+	}
+	if codexWebsocketsEnabled(disabledAuth) {
+		t.Fatal("expected websocket transport to stay disabled when websockets=false is configured")
 	}
 }
 

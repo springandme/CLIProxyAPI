@@ -5,6 +5,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -188,6 +189,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	if err != nil {
 		return resp, err
 	}
+	wsURL = applyCodexDenoProxy(auth, wsURL)
 
 	body, wsHeaders, continuity := applyCodexPromptCacheHeaders(ctx, auth, from, req, opts, body)
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
@@ -229,6 +231,10 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		bodyErr := websocketHandshakeBody(respHS)
 		if len(bodyErr) > 0 {
 			appendAPIResponseChunk(ctx, e.cfg, bodyErr)
+		}
+		if fallbackErr := maybeCodexDenoWebsocketFallback(auth, respHS, bodyErr, errDial); fallbackErr != nil {
+			recordAPIResponseError(ctx, e.cfg, errDial)
+			return resp, fallbackErr
 		}
 		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
 			return e.CodexExecutor.Execute(ctx, auth, req, opts)
@@ -384,6 +390,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	if err != nil {
 		return nil, err
 	}
+	wsURL = applyCodexDenoProxy(auth, wsURL)
 
 	body, wsHeaders, continuity := applyCodexPromptCacheHeaders(ctx, auth, from, req, opts, body)
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
@@ -426,6 +433,13 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		bodyErr := websocketHandshakeBody(respHS)
 		if len(bodyErr) > 0 {
 			appendAPIResponseChunk(ctx, e.cfg, bodyErr)
+		}
+		if fallbackErr := maybeCodexDenoWebsocketFallback(auth, respHS, bodyErr, errDial); fallbackErr != nil {
+			recordAPIResponseError(ctx, e.cfg, errDial)
+			if sess != nil {
+				sess.reqMu.Unlock()
+			}
+			return nil, fallbackErr
 		}
 		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
 			return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
@@ -931,6 +945,51 @@ func (e statusErrWithHeaders) Headers() http.Header {
 	return e.headers.Clone()
 }
 
+type codexDenoWebsocketFallbackError struct {
+	cause error
+}
+
+func (e codexDenoWebsocketFallbackError) Error() string {
+	if e.cause == nil {
+		return "codex websockets executor: deno relay websocket unavailable"
+	}
+	return fmt.Sprintf("codex websockets executor: deno relay websocket unavailable: %v", e.cause)
+}
+
+func (e codexDenoWebsocketFallbackError) Unwrap() error {
+	return e.cause
+}
+
+func maybeCodexDenoWebsocketFallback(auth *cliproxyauth.Auth, resp *http.Response, body []byte, err error) error {
+	if !codexUsesDenoProxy(auth) || err == nil {
+		return nil
+	}
+	return codexDenoWebsocketFallbackError{cause: buildCodexDenoWebsocketFallbackCause(resp, body, err)}
+}
+
+func buildCodexDenoWebsocketFallbackCause(resp *http.Response, body []byte, err error) error {
+	if resp != nil && resp.StatusCode > 0 {
+		msg := strings.TrimSpace(string(body))
+		if msg == "" {
+			if err != nil {
+				msg = err.Error()
+			} else {
+				msg = http.StatusText(resp.StatusCode)
+			}
+		}
+		return statusErr{code: resp.StatusCode, msg: msg}
+	}
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("codex websockets executor: deno relay websocket unavailable")
+}
+
+func isCodexDenoWebsocketFallbackError(err error) bool {
+	var target codexDenoWebsocketFallbackError
+	return errors.As(err, &target)
+}
+
 func parseCodexWebsocketError(payload []byte) (error, bool) {
 	if len(payload) == 0 {
 		return nil, false
@@ -1292,9 +1351,24 @@ func logCodexWebsocketDisconnected(sessionID string, authID string, wsURL string
 //  2. The selected auth enables websockets.
 //
 // For non-websocket downstream requests, it always uses the legacy HTTP implementation.
+type codexAutoHTTPExecutor interface {
+	PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error
+	HttpRequest(ctx context.Context, auth *cliproxyauth.Auth, req *http.Request) (*http.Response, error)
+	Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error)
+	ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error)
+	Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error)
+	CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error)
+}
+
+type codexAutoWebsocketExecutor interface {
+	Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error)
+	ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error)
+	CloseExecutionSession(sessionID string)
+}
+
 type CodexAutoExecutor struct {
-	httpExec *CodexExecutor
-	wsExec   *CodexWebsocketsExecutor
+	httpExec codexAutoHTTPExecutor
+	wsExec   codexAutoWebsocketExecutor
 }
 
 func NewCodexAutoExecutor(cfg *config.Config) *CodexAutoExecutor {
@@ -1325,7 +1399,12 @@ func (e *CodexAutoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 		return cliproxyexecutor.Response{}, fmt.Errorf("codex auto executor: executor is nil")
 	}
 	if cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketsEnabled(auth) {
-		return e.wsExec.Execute(ctx, auth, req, opts)
+		resp, err := e.wsExec.Execute(ctx, auth, req, opts)
+		if err != nil && codexUsesDenoProxy(auth) && isCodexDenoWebsocketFallbackError(err) {
+			log.Warnf("codex websockets: deno relay websocket failed, falling back to HTTP auth=%s err=%v", codexAuthID(auth), err)
+			return e.httpExec.Execute(ctx, auth, req, opts)
+		}
+		return resp, err
 	}
 	return e.httpExec.Execute(ctx, auth, req, opts)
 }
@@ -1335,7 +1414,12 @@ func (e *CodexAutoExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 		return nil, fmt.Errorf("codex auto executor: executor is nil")
 	}
 	if cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketsEnabled(auth) {
-		return e.wsExec.ExecuteStream(ctx, auth, req, opts)
+		result, err := e.wsExec.ExecuteStream(ctx, auth, req, opts)
+		if err != nil && codexUsesDenoProxy(auth) && isCodexDenoWebsocketFallbackError(err) {
+			log.Warnf("codex websockets: deno relay websocket stream failed, falling back to HTTP auth=%s err=%v", codexAuthID(auth), err)
+			return e.httpExec.ExecuteStream(ctx, auth, req, opts)
+		}
+		return result, err
 	}
 	return e.httpExec.ExecuteStream(ctx, auth, req, opts)
 }
@@ -1365,9 +1449,6 @@ func codexWebsocketsEnabled(auth *cliproxyauth.Auth) bool {
 	if auth == nil {
 		return false
 	}
-	if codexUsesDenoProxy(auth) {
-		return false
-	}
 	if len(auth.Attributes) > 0 {
 		if raw := strings.TrimSpace(auth.Attributes["websockets"]); raw != "" {
 			parsed, errParse := strconv.ParseBool(raw)
@@ -1394,4 +1475,11 @@ func codexWebsocketsEnabled(auth *cliproxyauth.Auth) bool {
 	default:
 	}
 	return false
+}
+
+func codexAuthID(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	return strings.TrimSpace(auth.ID)
 }

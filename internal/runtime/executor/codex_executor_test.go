@@ -24,6 +24,18 @@ func TestApplyCodexDenoProxy_RewritesOfficialResponsesEndpoints(t *testing.T) {
 	}
 }
 
+func TestApplyCodexDenoProxy_RewritesOfficialWebsocketEndpoints(t *testing.T) {
+	auth := &cliproxyauth.Auth{
+		Provider:   "codex",
+		Attributes: map[string]string{"deno_proxy_host": "https://relay.example.com/base"},
+	}
+
+	got := applyCodexDenoProxy(auth, "wss://chatgpt.com/backend-api/codex/responses?stream=true")
+	if got != "wss://relay.example.com/base/codex/responses?stream=true" {
+		t.Fatalf("websocket URL = %q", got)
+	}
+}
+
 func TestApplyCodexDenoProxy_LeavesCustomBaseURLUntouched(t *testing.T) {
 	auth := &cliproxyauth.Auth{
 		Provider:   "codex",

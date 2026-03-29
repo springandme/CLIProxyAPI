@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -96,13 +97,10 @@ func applyCodexDenoProxy(auth *cliproxyauth.Auth, targetURL string) string {
 		return targetURL
 	}
 
-	prefix := strings.TrimSuffix(codexDefaultBaseURL, "/")
-	if !strings.HasPrefix(normalizedTarget, prefix) {
+	proxyURL, rewritten := rewriteCodexDenoProxyURL(denoHost, normalizedTarget)
+	if !rewritten {
 		return targetURL
 	}
-
-	suffix := strings.TrimPrefix(normalizedTarget, prefix)
-	proxyURL := denoHost + codexDenoProxyPrefix + suffix
 
 	authID := ""
 	if auth != nil {
@@ -110,6 +108,71 @@ func applyCodexDenoProxy(auth *cliproxyauth.Auth, targetURL string) string {
 	}
 	log.Infof("codex deno proxy: forwarding request [auth=%s] from %s -> %s", authID, normalizedTarget, proxyURL)
 	return proxyURL
+}
+
+func rewriteCodexDenoProxyURL(denoHost string, targetURL string) (string, bool) {
+	parsedTarget, err := url.Parse(strings.TrimSpace(targetURL))
+	if err != nil || parsedTarget == nil {
+		return "", false
+	}
+	parsedOfficial, err := url.Parse(codexDefaultBaseURL)
+	if err != nil || parsedOfficial == nil {
+		return "", false
+	}
+	parsedRelay, err := url.Parse(strings.TrimSpace(denoHost))
+	if err != nil || parsedRelay == nil {
+		return "", false
+	}
+
+	targetScheme := strings.ToLower(parsedTarget.Scheme)
+	websocket := false
+	switch targetScheme {
+	case "http", "https":
+	case "ws":
+		targetScheme = "http"
+		websocket = true
+	case "wss":
+		targetScheme = "https"
+		websocket = true
+	default:
+		return "", false
+	}
+
+	if !strings.EqualFold(parsedTarget.Host, parsedOfficial.Host) {
+		return "", false
+	}
+
+	officialPath := strings.TrimSuffix(parsedOfficial.Path, "/")
+	targetPath := parsedTarget.Path
+	if targetPath == "" {
+		targetPath = "/"
+	}
+	if targetPath != officialPath && !strings.HasPrefix(targetPath, officialPath+"/") {
+		return "", false
+	}
+
+	suffix := strings.TrimPrefix(targetPath, officialPath)
+	if suffix == "" {
+		suffix = "/"
+	}
+
+	relayPath := strings.TrimSuffix(parsedRelay.Path, "/")
+	parsedRelay.Path = relayPath + codexDenoProxyPrefix + suffix
+	parsedRelay.RawPath = ""
+	parsedRelay.RawQuery = parsedTarget.RawQuery
+	parsedRelay.Fragment = parsedTarget.Fragment
+	if websocket {
+		switch strings.ToLower(parsedRelay.Scheme) {
+		case "http":
+			parsedRelay.Scheme = "ws"
+		case "https":
+			parsedRelay.Scheme = "wss"
+		default:
+			return "", false
+		}
+	}
+
+	return parsedRelay.String(), true
 }
 
 func rewriteCodexHTTPRequestForDeno(auth *cliproxyauth.Auth, req *http.Request) error {
