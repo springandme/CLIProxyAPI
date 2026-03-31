@@ -63,30 +63,47 @@ jobs:
         run: |
           git push --force-with-lease origin "$SYNC_BRANCH"
 
-      - name: Create or update PR
+      - name: Validate PR token
         if: steps.diff.outputs.has_changes == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
         run: |
-          pr_number="$(gh pr list --state open --base main --head "$SYNC_BRANCH" --json number --jq '.[0].number')"
-          if [ -z "$pr_number" ] || [ "$pr_number" = "null" ]; then
-            gh pr create \
-              --base main \
-              --head "$SYNC_BRANCH" \
-              --title "$PR_TITLE" \
-              --body "$PR_BODY"
-            pr_number="$(gh pr list --state open --base main --head "$SYNC_BRANCH" --json number --jq '.[0].number')"
+          if [ -z "$UPSTREAM_SYNC_TOKEN" ]; then
+            echo "::error::Missing repository secret UPSTREAM_SYNC_TOKEN. Configure a fine-grained PAT with Contents:write and Pull requests:write."
+            exit 1
+          fi
+
+      - name: Create or update PR
+        if: steps.diff.outputs.has_changes == 'true'
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          head_ref="${GITHUB_REPOSITORY_OWNER}:${SYNC_BRANCH}"
+          pr_number="$(gh api "repos/${GITHUB_REPOSITORY}/pulls?state=open&base=main&head=${head_ref}" --jq '.[0].number // empty')"
+          if [ -z "$pr_number" ]; then
+            pr_number="$(gh api "repos/${GITHUB_REPOSITORY}/pulls" \
+              --method POST \
+              -f title="$PR_TITLE" \
+              -f head="$SYNC_BRANCH" \
+              -f base="main" \
+              -f body="$PR_BODY" \
+              --jq '.number')"
           else
-            gh pr edit "$pr_number" --title "$PR_TITLE" --body "$PR_BODY"
+            gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" \
+              --method PATCH \
+              -f title="$PR_TITLE" \
+              -f body="$PR_BODY" >/dev/null
           fi
           echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
 
       - name: Enable auto-merge when allowed
         if: steps.diff.outputs.has_changes == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
         run: |
-          pr_number="$(gh pr list --state open --base main --head "$SYNC_BRANCH" --json number --jq '.[0].number')"
+          pr_number="${{ steps.pr.outputs.pr_number }}"
           if [ -n "$pr_number" ] && [ "$pr_number" != "null" ]; then
             gh pr merge "$pr_number" --auto --merge || true
           fi
