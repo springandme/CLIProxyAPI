@@ -79,8 +79,6 @@ async function handleWebSocketRelay(
 ): Promise<Response> {
   const targetWsUrl = toWebSocketUrl(targetHttpUrl);
   const upstreamHeaders = buildUpstreamHeaders(request, targetHttpUrl, true);
-  const { socket: downstreamSocket, response } = Deno.upgradeWebSocket(request);
-  downstreamSocket.binaryType = "arraybuffer";
 
   const upstreamSocket = new WebSocket(targetWsUrl, {
     headers: upstreamHeaders,
@@ -93,6 +91,18 @@ async function handleWebSocketRelay(
     return jsonError(openResult.status, openResult.message);
   }
 
+  let downstreamSocket: WebSocket;
+  let response: Response;
+  try {
+    const upgraded = Deno.upgradeWebSocket(request);
+    downstreamSocket = upgraded.socket;
+    response = upgraded.response;
+  } catch (error) {
+    safeCloseSocket(upstreamSocket, 1011, "Failed to upgrade downstream websocket");
+    throw error;
+  }
+
+  downstreamSocket.binaryType = "arraybuffer";
   wireWebSocketRelay(downstreamSocket, upstreamSocket);
   return response;
 }
