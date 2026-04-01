@@ -797,6 +797,10 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 			dst = abs
 		}
 	}
+	return h.writeAuthFileAtPath(ctx, dst, data)
+}
+
+func (h *Handler) writeAuthFileAtPath(ctx context.Context, dst string, data []byte) error {
 	auth, err := h.buildAuthFromFileData(dst, data)
 	if err != nil {
 		return err
@@ -999,6 +1003,10 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	if provider == "" {
 		provider = "unknown"
 	}
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "gemini" {
+		provider = "gemini-cli"
+	}
 	label := provider
 	if email, ok := metadata["email"].(string); ok && email != "" {
 		label = email
@@ -1013,16 +1021,77 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 		"path":   path,
 		"source": path,
 	}
+
+	proxyURL := ""
+	if rawProxyURL, ok := metadata["proxy_url"].(string); ok {
+		proxyURL = strings.TrimSpace(rawProxyURL)
+	}
+
+	prefix := ""
+	if rawPrefix, ok := metadata["prefix"].(string); ok {
+		trimmedPrefix := strings.TrimSpace(rawPrefix)
+		trimmedPrefix = strings.Trim(trimmedPrefix, "/")
+		if trimmedPrefix != "" && !strings.Contains(trimmedPrefix, "/") {
+			prefix = trimmedPrefix
+		}
+	}
+
+	disabled := false
+	if rawDisabled, ok := metadata["disabled"]; ok {
+		switch v := rawDisabled.(type) {
+		case bool:
+			disabled = v
+		case string:
+			disabled = strings.EqualFold(strings.TrimSpace(v), "true")
+		case float64:
+			disabled = v != 0
+		}
+	}
+
+	status := coreauth.StatusActive
+	if disabled {
+		status = coreauth.StatusDisabled
+	}
 	auth := &coreauth.Auth{
 		ID:         authID,
 		Provider:   provider,
 		FileName:   filepath.Base(path),
 		Label:      label,
-		Status:     coreauth.StatusActive,
+		Prefix:     prefix,
+		Status:     status,
+		Disabled:   disabled,
 		Attributes: attr,
+		ProxyURL:   proxyURL,
 		Metadata:   metadata,
 		CreatedAt:  time.Now(),
 		UpdatedAt:  time.Now(),
+	}
+	if rawPriority, ok := metadata["priority"]; ok {
+		switch v := rawPriority.(type) {
+		case float64:
+			auth.Attributes["priority"] = strconv.Itoa(int(v))
+		case string:
+			priority := strings.TrimSpace(v)
+			if _, errAtoi := strconv.Atoi(priority); errAtoi == nil {
+				auth.Attributes["priority"] = priority
+			}
+		}
+	}
+	if rawNote, ok := metadata["note"]; ok {
+		if note, okStr := rawNote.(string); okStr {
+			if trimmed := strings.TrimSpace(note); trimmed != "" {
+				auth.Attributes["note"] = trimmed
+			}
+		}
+	}
+	if rawDenoHost, ok := metadata["deno_proxy_host"]; ok {
+		if denoHost := strings.TrimSpace(fmt.Sprint(rawDenoHost)); denoHost != "" {
+			auth.Attributes["deno_proxy_host"] = denoHost
+		}
+	} else if rawDenoHost, ok := metadata["deno-proxy-host"]; ok {
+		if denoHost := strings.TrimSpace(fmt.Sprint(rawDenoHost)); denoHost != "" {
+			auth.Attributes["deno_proxy_host"] = denoHost
+		}
 	}
 	if hasLastRefresh {
 		auth.LastRefreshedAt = lastRefresh
