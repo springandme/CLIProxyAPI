@@ -39,7 +39,9 @@ type Handler struct {
 	configFilePath      string
 	mu                  sync.Mutex
 	attemptsMu          sync.Mutex
+	batchTasksMu        sync.RWMutex
 	failedAttempts      map[string]*attemptInfo // keyed by client IP
+	batchImportTasks    map[string]*authFileBatchImportTask
 	authManager         *coreauth.Manager
 	usageStats          *usage.RequestStatistics
 	tokenStore          coreauth.Store
@@ -59,6 +61,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		cfg:                 cfg,
 		configFilePath:      configFilePath,
 		failedAttempts:      make(map[string]*attemptInfo),
+		batchImportTasks:    make(map[string]*authFileBatchImportTask),
 		authManager:         manager,
 		usageStats:          usage.GetRequestStatistics(),
 		tokenStore:          sdkAuth.GetTokenStore(),

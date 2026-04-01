@@ -1011,6 +1011,9 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	if email, ok := metadata["email"].(string); ok && email != "" {
 		label = email
 	}
+	if rawLabel, ok := metadata["label"].(string); ok && strings.TrimSpace(rawLabel) != "" {
+		label = strings.TrimSpace(rawLabel)
+	}
 	lastRefresh, hasLastRefresh := extractLastRefreshTimestamp(metadata)
 
 	authID := h.authIDForPath(path)

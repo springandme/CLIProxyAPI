@@ -630,6 +630,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/auth-files/fields", s.mgmt.PatchAuthFileFields)
 		mgmt.POST("/auth-files/batch-export", s.mgmt.ExportAuthFilesBatch)
 		mgmt.POST("/auth-files/batch-import", s.mgmt.ImportAuthFilesBatch)
+		mgmt.POST("/auth-files/batch-import-tasks", s.mgmt.CreateAuthFilesBatchImportTask)
+		mgmt.GET("/auth-files/batch-import-tasks/:taskID", s.mgmt.GetAuthFilesBatchImportTask)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)

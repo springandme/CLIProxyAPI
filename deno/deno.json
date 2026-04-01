@@ -1,0 +1,13 @@
+{
+  "tasks": {
+    "dev": "deno run --allow-net codex-proxy.ts",
+    "check": "deno check codex-proxy.ts",
+    "fmt": "deno fmt codex-proxy.ts README.md",
+    "lint": "deno lint codex-proxy.ts"
+  },
+  "fmt": {
+    "lineWidth": 88,
+    "semiColons": true,
+    "singleQuote": false
+  }
+}

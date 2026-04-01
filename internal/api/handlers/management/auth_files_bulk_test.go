@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -25,6 +26,7 @@ func TestBuildAuthFromFileData_MapsEditableFields(t *testing.T) {
 
 	auth, err := h.buildAuthFromFileData(filepath.Join(authDir, "codex.json"), []byte(`{
 		"type":"codex",
+		"label":"Team Owner",
 		"email":"user@example.com",
 		"disabled":true,
 		"prefix":"team-a",
@@ -39,6 +41,9 @@ func TestBuildAuthFromFileData_MapsEditableFields(t *testing.T) {
 
 	if auth.Provider != "codex" {
 		t.Fatalf("expected provider codex, got %q", auth.Provider)
+	}
+	if auth.Label != "Team Owner" {
+		t.Fatalf("expected label Team Owner, got %q", auth.Label)
 	}
 	if auth.Prefix != "team-a" {
 		t.Fatalf("expected prefix team-a, got %q", auth.Prefix)
@@ -128,6 +133,62 @@ func TestExportAuthFilesBatch_ReturnsDynamicColumnsAndInfo(t *testing.T) {
 	}
 	if !containsString(payload.ReadonlyColumns, authFileBatchInfoPrefix+"type") {
 		t.Fatalf("expected info_type in readonly columns: %#v", payload.ReadonlyColumns)
+	}
+}
+
+func TestExportAuthFilesBatch_IncludesPreferredEditableColumnsWhenMissing(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	fileName := "codex-user.json"
+	fileBody := `{
+		"type":"codex",
+		"email":"codex@example.com"
+	}`
+	if err := os.WriteFile(filepath.Join(authDir, fileName), []byte(fileBody), 0o600); err != nil {
+		t.Fatalf("failed to seed auth file: %v", err)
+	}
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth, err := hBuildAndRegisterAuth(t, authDir, manager, fileName, []byte(fileBody))
+	if err != nil {
+		t.Fatalf("failed to register auth: %v", err)
+	}
+	if _, err = manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("failed to register auth in manager: %v", err)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/batch-export", bytes.NewBufferString(`{"names":["codex-user.json"]}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	h.ExportAuthFilesBatch(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected export status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	var payload authFileBatchExportResponse
+	if err = json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("failed to decode export payload: %v", err)
+	}
+	for _, column := range []string{"disabled", "label", "prefix", "proxy_url", "note", "deno_proxy_host", "websockets"} {
+		if !containsString(payload.EditableColumns, column) {
+			t.Fatalf("expected editable column %q in payload: %#v", column, payload.EditableColumns)
+		}
+	}
+	if len(payload.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(payload.Rows))
+	}
+	row := payload.Rows[0]
+	if _, ok := row["disabled"]; !ok {
+		t.Fatalf("expected disabled column to exist in row: %#v", row)
+	}
+	if _, ok := row["websockets"]; !ok {
+		t.Fatalf("expected websockets column to exist in row: %#v", row)
 	}
 }
 
@@ -228,6 +289,116 @@ func TestImportAuthFilesBatch_AppliesSetAndClearOperations(t *testing.T) {
 	}
 	if got := updatedAuth.Attributes["note"]; got != "new-note" {
 		t.Fatalf("expected runtime auth note attribute to be updated, got %q", got)
+	}
+}
+
+func TestCreateAuthFilesBatchImportTask_CompletesAndTracksProgress(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	fileName := "codex-user.json"
+	original := `{
+		"type":"codex",
+		"email":"codex@example.com",
+		"note":"old-note"
+	}`
+	if err := os.WriteFile(filepath.Join(authDir, fileName), []byte(original), 0o600); err != nil {
+		t.Fatalf("failed to seed auth file: %v", err)
+	}
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth, err := hBuildAndRegisterAuth(t, authDir, manager, fileName, []byte(original))
+	if err != nil {
+		t.Fatalf("failed to build auth: %v", err)
+	}
+	if _, err = manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("failed to register auth: %v", err)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	reqBody := `{
+		"rows":[
+			{
+				"name":"codex-user.json",
+				"expected_provider":"codex",
+				"expected_type":"codex",
+				"fields":{
+					"note":{"op":"set","value":"task-note"},
+					"disabled":{"op":"set","value":true}
+				}
+			}
+		]
+	}`
+	createRec := httptest.NewRecorder()
+	createCtx, _ := gin.CreateTestContext(createRec)
+	createCtx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/batch-import-tasks", bytes.NewBufferString(reqBody))
+	createCtx.Request.Header.Set("Content-Type", "application/json")
+
+	h.CreateAuthFilesBatchImportTask(createCtx)
+
+	if createRec.Code != http.StatusAccepted {
+		t.Fatalf("expected create task status %d, got %d with body %s", http.StatusAccepted, createRec.Code, createRec.Body.String())
+	}
+
+	var createPayload authFileBatchImportTaskCreateResponse
+	if err = json.Unmarshal(createRec.Body.Bytes(), &createPayload); err != nil {
+		t.Fatalf("failed to decode create task payload: %v", err)
+	}
+	if createPayload.TaskID == "" {
+		t.Fatalf("expected non-empty task id")
+	}
+
+	var taskPayload authFileBatchImportTaskResponse
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		getRec := httptest.NewRecorder()
+		getCtx, _ := gin.CreateTestContext(getRec)
+		getCtx.Params = gin.Params{{Key: "taskID", Value: createPayload.TaskID}}
+		getCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/batch-import-tasks/"+createPayload.TaskID, nil)
+
+		h.GetAuthFilesBatchImportTask(getCtx)
+		if getRec.Code != http.StatusOK {
+			t.Fatalf("expected get task status %d, got %d with body %s", http.StatusOK, getRec.Code, getRec.Body.String())
+		}
+		if err = json.Unmarshal(getRec.Body.Bytes(), &taskPayload); err != nil {
+			t.Fatalf("failed to decode task payload: %v", err)
+		}
+		if taskPayload.Status == authFileBatchImportTaskStatusCompleted {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if taskPayload.Status != authFileBatchImportTaskStatusCompleted {
+		t.Fatalf("expected task to complete, got %#v", taskPayload)
+	}
+	if taskPayload.TotalRows != 1 || taskPayload.ProcessedRows != 1 {
+		t.Fatalf("expected processed rows 1/1, got %#v", taskPayload)
+	}
+	if taskPayload.Updated != 1 || taskPayload.Skipped != 0 || taskPayload.Failed != 0 {
+		t.Fatalf("unexpected task counters: %#v", taskPayload)
+	}
+	if taskPayload.CurrentFile != "" {
+		t.Fatalf("expected current file to be cleared after completion, got %q", taskPayload.CurrentFile)
+	}
+	if len(taskPayload.Files) != 1 || taskPayload.Files[0] != fileName {
+		t.Fatalf("unexpected updated files: %#v", taskPayload.Files)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(authDir, fileName))
+	if err != nil {
+		t.Fatalf("failed to read updated auth file: %v", err)
+	}
+	var stored map[string]any
+	if err = json.Unmarshal(raw, &stored); err != nil {
+		t.Fatalf("failed to decode updated auth file: %v", err)
+	}
+	if got := stored["note"]; got != "task-note" {
+		t.Fatalf("expected note to be updated, got %#v", got)
+	}
+	if got := stored["disabled"]; got != true {
+		t.Fatalf("expected disabled to be updated, got %#v", got)
 	}
 }
 

@@ -1,5 +1,3 @@
-import { serve } from "https://deno.land/std/http/server.ts";
-
 const CODEX_PREFIX = "/codex";
 const CODEX_UPSTREAM = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_USER_AGENT =
@@ -19,7 +17,7 @@ const HOP_BY_HOP_HEADERS = new Set([
   "upgrade",
 ]);
 
-serve(async (request) => {
+Deno.serve(async (request) => {
   const url = new URL(request.url);
   const pathname = url.pathname;
 
@@ -79,10 +77,7 @@ async function handleWebSocketRelay(
 ): Promise<Response> {
   const targetWsUrl = toWebSocketUrl(targetHttpUrl);
   const upstreamHeaders = buildUpstreamHeaders(request, targetHttpUrl, true);
-
-  const upstreamSocket = new WebSocket(targetWsUrl, {
-    headers: upstreamHeaders,
-  });
+  const upstreamSocket = openUpstreamWebSocket(targetWsUrl, upstreamHeaders);
   upstreamSocket.binaryType = "arraybuffer";
 
   const openResult = await waitForWebSocketOpen(upstreamSocket, targetWsUrl);
@@ -105,6 +100,19 @@ async function handleWebSocketRelay(
   downstreamSocket.binaryType = "arraybuffer";
   wireWebSocketRelay(downstreamSocket, upstreamSocket);
   return response;
+}
+
+function openUpstreamWebSocket(
+  targetWsUrl: string,
+  upstreamHeaders: Headers,
+): WebSocket {
+  // Keep the options object explicitly typed so Deploy console type-checking
+  // resolves the second constructor argument as WebSocketOptions instead of
+  // falling back to the legacy `protocols: string | string[]` overload.
+  const options: WebSocketOptions = {
+    headers: upstreamHeaders,
+  };
+  return new WebSocket(targetWsUrl, options);
 }
 
 function buildUpstreamHeaders(
