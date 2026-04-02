@@ -90,7 +90,8 @@ type authFileBatchExportResponse struct {
 }
 
 type authFileBatchImportRequest struct {
-	Rows []authFileBatchImportRow `json:"rows"`
+	Rows          []authFileBatchImportRow `json:"rows"`
+	CreateMissing bool                     `json:"create_missing,omitempty"`
 }
 
 type authFileBatchImportRow struct {
@@ -112,6 +113,7 @@ type authFileBatchFailure struct {
 
 type authFileBatchImportResponse struct {
 	Status  string                 `json:"status"`
+	Created int                    `json:"created"`
 	Updated int                    `json:"updated"`
 	Skipped int                    `json:"skipped"`
 	Files   []string               `json:"files,omitempty"`
@@ -128,6 +130,7 @@ type authFileBatchImportTaskResponse struct {
 	Status        authFileBatchImportTaskStatus `json:"status"`
 	TotalRows     int                           `json:"total_rows"`
 	ProcessedRows int                           `json:"processed_rows"`
+	Created       int                           `json:"created"`
 	Updated       int                           `json:"updated"`
 	Skipped       int                           `json:"skipped"`
 	Failed        int                           `json:"failed"`
@@ -145,6 +148,7 @@ type authFileBatchImportTask struct {
 	Status        authFileBatchImportTaskStatus
 	TotalRows     int
 	ProcessedRows int
+	Created       int
 	Updated       int
 	Skipped       int
 	Failed        int
@@ -226,7 +230,7 @@ func (h *Handler) ImportAuthFilesBatch(c *gin.Context) {
 		return
 	}
 
-	result := h.importAuthFilesBatch(c.Request.Context(), req.Rows, nil)
+	result := h.importAuthFilesBatch(c.Request.Context(), req.Rows, req.CreateMissing, nil)
 	writeAuthFileBatchImportResponse(c, result)
 }
 
@@ -247,7 +251,7 @@ func (h *Handler) CreateAuthFilesBatchImportTask(c *gin.Context) {
 	}
 
 	task := h.createAuthFileBatchImportTask(len(req.Rows))
-	go h.runAuthFilesBatchImportTask(task.ID, req.Rows)
+	go h.runAuthFilesBatchImportTask(task.ID, req.Rows, req.CreateMissing)
 
 	c.JSON(http.StatusAccepted, authFileBatchImportTaskCreateResponse{
 		Status: "accepted",
@@ -554,6 +558,31 @@ func applyAuthFileBatchFieldActions(metadata map[string]any, fields map[string]a
 	return next, changed, nil
 }
 
+func buildAuthFileBatchMetadataForCreate(row authFileBatchImportRow) (map[string]any, error) {
+	expectedType := normalizeBatchAuthType(row.ExpectedType)
+	if expectedType == "" {
+		return nil, fmt.Errorf("expected_type is required to create missing auth file")
+	}
+
+	expectedProvider := normalizeBatchAuthProvider(row.ExpectedProvider)
+	currentProvider := normalizeBatchAuthProvider(expectedType)
+	if expectedProvider != "" && expectedProvider != currentProvider {
+		return nil, fmt.Errorf("provider mismatch: expected %s, got %s", expectedProvider, currentProvider)
+	}
+
+	metadata := map[string]any{
+		"type": expectedType,
+	}
+	next, changed, err := applyAuthFileBatchFieldActions(metadata, row.Fields)
+	if err != nil {
+		return nil, err
+	}
+	if !changed {
+		return nil, fmt.Errorf("cannot create missing auth file without any set fields")
+	}
+	return next, nil
+}
+
 func firstNonEmpty(values ...any) any {
 	for _, value := range values {
 		switch typed := value.(type) {
@@ -571,10 +600,12 @@ func firstNonEmpty(values ...any) any {
 	return nil
 }
 
-func (h *Handler) importAuthFilesBatch(ctx context.Context, rows []authFileBatchImportRow, progress func(*authFileBatchImportTask)) authFileBatchImportResponse {
+func (h *Handler) importAuthFilesBatch(ctx context.Context, rows []authFileBatchImportRow, createMissing bool, progress func(*authFileBatchImportTask)) authFileBatchImportResponse {
 	seenNames := make(map[string]struct{}, len(rows))
-	updatedFiles := make([]string, 0, len(rows))
+	changedFiles := make([]string, 0, len(rows))
 	failed := make([]authFileBatchFailure, 0)
+	created := 0
+	updated := 0
 	skipped := 0
 
 	task := &authFileBatchImportTask{TotalRows: len(rows)}
@@ -585,19 +616,21 @@ func (h *Handler) importAuthFilesBatch(ctx context.Context, rows []authFileBatch
 				failed = append(failed, authFileBatchFailure{Name: "", Error: ctx.Err().Error()})
 				task.Error = ctx.Err().Error()
 				task.ProcessedRows = idx
-				task.Updated = len(updatedFiles)
+				task.Created = created
+				task.Updated = updated
 				task.Skipped = skipped
 				task.Failed = len(failed)
-				task.Files = append([]string(nil), updatedFiles...)
+				task.Files = append([]string(nil), changedFiles...)
 				task.Failures = append([]authFileBatchFailure(nil), failed...)
 				if progress != nil {
 					progress(task)
 				}
 				return authFileBatchImportResponse{
 					Status:  "partial",
-					Updated: len(updatedFiles),
+					Created: created,
+					Updated: updated,
 					Skipped: skipped,
-					Files:   updatedFiles,
+					Files:   changedFiles,
 					Failed:  failed,
 				}
 			default:
@@ -609,10 +642,11 @@ func (h *Handler) importAuthFilesBatch(ctx context.Context, rows []authFileBatch
 		if name == "" {
 			failed = append(failed, authFileBatchFailure{Name: "", Error: "name is required"})
 			task.ProcessedRows = idx + 1
-			task.Updated = len(updatedFiles)
+			task.Created = created
+			task.Updated = updated
 			task.Skipped = skipped
 			task.Failed = len(failed)
-			task.Files = append([]string(nil), updatedFiles...)
+			task.Files = append([]string(nil), changedFiles...)
 			task.Failures = append([]authFileBatchFailure(nil), failed...)
 			if progress != nil {
 				progress(task)
@@ -622,10 +656,11 @@ func (h *Handler) importAuthFilesBatch(ctx context.Context, rows []authFileBatch
 		if _, ok := seenNames[name]; ok {
 			failed = append(failed, authFileBatchFailure{Name: name, Error: "duplicate row for auth file"})
 			task.ProcessedRows = idx + 1
-			task.Updated = len(updatedFiles)
+			task.Created = created
+			task.Updated = updated
 			task.Skipped = skipped
 			task.Failed = len(failed)
-			task.Files = append([]string(nil), updatedFiles...)
+			task.Files = append([]string(nil), changedFiles...)
 			task.Failures = append([]authFileBatchFailure(nil), failed...)
 			if progress != nil {
 				progress(task)
@@ -637,10 +672,11 @@ func (h *Handler) importAuthFilesBatch(ctx context.Context, rows []authFileBatch
 		if len(row.Fields) == 0 {
 			skipped++
 			task.ProcessedRows = idx + 1
-			task.Updated = len(updatedFiles)
+			task.Created = created
+			task.Updated = updated
 			task.Skipped = skipped
 			task.Failed = len(failed)
-			task.Files = append([]string(nil), updatedFiles...)
+			task.Files = append([]string(nil), changedFiles...)
 			task.Failures = append([]authFileBatchFailure(nil), failed...)
 			if progress != nil {
 				progress(task)
@@ -650,12 +686,77 @@ func (h *Handler) importAuthFilesBatch(ctx context.Context, rows []authFileBatch
 
 		path, metadata, err := h.readManagedAuthFileJSON(name)
 		if err != nil {
+			if createMissing && errors.Is(err, errAuthFileNotFound) {
+				path, err = h.resolveManagedAuthFilePath(name)
+				if err == nil {
+					metadata, err = buildAuthFileBatchMetadataForCreate(row)
+				}
+				if err != nil {
+					failed = append(failed, authFileBatchFailure{Name: name, Error: err.Error()})
+					task.ProcessedRows = idx + 1
+					task.Created = created
+					task.Updated = updated
+					task.Skipped = skipped
+					task.Failed = len(failed)
+					task.Files = append([]string(nil), changedFiles...)
+					task.Failures = append([]authFileBatchFailure(nil), failed...)
+					if progress != nil {
+						progress(task)
+					}
+					continue
+				}
+
+				raw, errMarshal := json.Marshal(metadata)
+				if errMarshal != nil {
+					failed = append(failed, authFileBatchFailure{Name: name, Error: fmt.Sprintf("failed to encode auth file: %v", errMarshal)})
+					task.ProcessedRows = idx + 1
+					task.Created = created
+					task.Updated = updated
+					task.Skipped = skipped
+					task.Failed = len(failed)
+					task.Files = append([]string(nil), changedFiles...)
+					task.Failures = append([]authFileBatchFailure(nil), failed...)
+					if progress != nil {
+						progress(task)
+					}
+					continue
+				}
+				if err = h.writeAuthFileAtPath(ctx, path, raw); err != nil {
+					failed = append(failed, authFileBatchFailure{Name: name, Error: err.Error()})
+					task.ProcessedRows = idx + 1
+					task.Created = created
+					task.Updated = updated
+					task.Skipped = skipped
+					task.Failed = len(failed)
+					task.Files = append([]string(nil), changedFiles...)
+					task.Failures = append([]authFileBatchFailure(nil), failed...)
+					if progress != nil {
+						progress(task)
+					}
+					continue
+				}
+
+				created++
+				changedFiles = append(changedFiles, name)
+				task.ProcessedRows = idx + 1
+				task.Created = created
+				task.Updated = updated
+				task.Skipped = skipped
+				task.Failed = len(failed)
+				task.Files = append([]string(nil), changedFiles...)
+				task.Failures = append([]authFileBatchFailure(nil), failed...)
+				if progress != nil {
+					progress(task)
+				}
+				continue
+			}
 			failed = append(failed, authFileBatchFailure{Name: name, Error: err.Error()})
 			task.ProcessedRows = idx + 1
-			task.Updated = len(updatedFiles)
+			task.Created = created
+			task.Updated = updated
 			task.Skipped = skipped
 			task.Failed = len(failed)
-			task.Files = append([]string(nil), updatedFiles...)
+			task.Files = append([]string(nil), changedFiles...)
 			task.Failures = append([]authFileBatchFailure(nil), failed...)
 			if progress != nil {
 				progress(task)
@@ -668,10 +769,11 @@ func (h *Handler) importAuthFilesBatch(ctx context.Context, rows []authFileBatch
 		if expectedProvider := normalizeBatchAuthProvider(row.ExpectedProvider); expectedProvider != "" && expectedProvider != currentProvider {
 			failed = append(failed, authFileBatchFailure{Name: name, Error: fmt.Sprintf("provider mismatch: expected %s, got %s", expectedProvider, currentProvider)})
 			task.ProcessedRows = idx + 1
-			task.Updated = len(updatedFiles)
+			task.Created = created
+			task.Updated = updated
 			task.Skipped = skipped
 			task.Failed = len(failed)
-			task.Files = append([]string(nil), updatedFiles...)
+			task.Files = append([]string(nil), changedFiles...)
 			task.Failures = append([]authFileBatchFailure(nil), failed...)
 			if progress != nil {
 				progress(task)
@@ -681,10 +783,11 @@ func (h *Handler) importAuthFilesBatch(ctx context.Context, rows []authFileBatch
 		if expectedType := normalizeBatchAuthType(row.ExpectedType); expectedType != "" && expectedType != normalizeBatchAuthType(currentType) {
 			failed = append(failed, authFileBatchFailure{Name: name, Error: fmt.Sprintf("type mismatch: expected %s, got %s", expectedType, normalizeBatchAuthType(currentType))})
 			task.ProcessedRows = idx + 1
-			task.Updated = len(updatedFiles)
+			task.Created = created
+			task.Updated = updated
 			task.Skipped = skipped
 			task.Failed = len(failed)
-			task.Files = append([]string(nil), updatedFiles...)
+			task.Files = append([]string(nil), changedFiles...)
 			task.Failures = append([]authFileBatchFailure(nil), failed...)
 			if progress != nil {
 				progress(task)
@@ -696,10 +799,11 @@ func (h *Handler) importAuthFilesBatch(ctx context.Context, rows []authFileBatch
 		if err != nil {
 			failed = append(failed, authFileBatchFailure{Name: name, Error: err.Error()})
 			task.ProcessedRows = idx + 1
-			task.Updated = len(updatedFiles)
+			task.Created = created
+			task.Updated = updated
 			task.Skipped = skipped
 			task.Failed = len(failed)
-			task.Files = append([]string(nil), updatedFiles...)
+			task.Files = append([]string(nil), changedFiles...)
 			task.Failures = append([]authFileBatchFailure(nil), failed...)
 			if progress != nil {
 				progress(task)
@@ -709,10 +813,11 @@ func (h *Handler) importAuthFilesBatch(ctx context.Context, rows []authFileBatch
 		if !changed {
 			skipped++
 			task.ProcessedRows = idx + 1
-			task.Updated = len(updatedFiles)
+			task.Created = created
+			task.Updated = updated
 			task.Skipped = skipped
 			task.Failed = len(failed)
-			task.Files = append([]string(nil), updatedFiles...)
+			task.Files = append([]string(nil), changedFiles...)
 			task.Failures = append([]authFileBatchFailure(nil), failed...)
 			if progress != nil {
 				progress(task)
@@ -724,10 +829,11 @@ func (h *Handler) importAuthFilesBatch(ctx context.Context, rows []authFileBatch
 		if err != nil {
 			failed = append(failed, authFileBatchFailure{Name: name, Error: fmt.Sprintf("failed to encode auth file: %v", err)})
 			task.ProcessedRows = idx + 1
-			task.Updated = len(updatedFiles)
+			task.Created = created
+			task.Updated = updated
 			task.Skipped = skipped
 			task.Failed = len(failed)
-			task.Files = append([]string(nil), updatedFiles...)
+			task.Files = append([]string(nil), changedFiles...)
 			task.Failures = append([]authFileBatchFailure(nil), failed...)
 			if progress != nil {
 				progress(task)
@@ -737,10 +843,11 @@ func (h *Handler) importAuthFilesBatch(ctx context.Context, rows []authFileBatch
 		if err = h.writeAuthFileAtPath(ctx, path, raw); err != nil {
 			failed = append(failed, authFileBatchFailure{Name: name, Error: err.Error()})
 			task.ProcessedRows = idx + 1
-			task.Updated = len(updatedFiles)
+			task.Created = created
+			task.Updated = updated
 			task.Skipped = skipped
 			task.Failed = len(failed)
-			task.Files = append([]string(nil), updatedFiles...)
+			task.Files = append([]string(nil), changedFiles...)
 			task.Failures = append([]authFileBatchFailure(nil), failed...)
 			if progress != nil {
 				progress(task)
@@ -748,12 +855,14 @@ func (h *Handler) importAuthFilesBatch(ctx context.Context, rows []authFileBatch
 			continue
 		}
 
-		updatedFiles = append(updatedFiles, name)
+		updated++
+		changedFiles = append(changedFiles, name)
 		task.ProcessedRows = idx + 1
-		task.Updated = len(updatedFiles)
+		task.Created = created
+		task.Updated = updated
 		task.Skipped = skipped
 		task.Failed = len(failed)
-		task.Files = append([]string(nil), updatedFiles...)
+		task.Files = append([]string(nil), changedFiles...)
 		task.Failures = append([]authFileBatchFailure(nil), failed...)
 		if progress != nil {
 			progress(task)
@@ -766,9 +875,10 @@ func (h *Handler) importAuthFilesBatch(ctx context.Context, rows []authFileBatch
 	}
 	return authFileBatchImportResponse{
 		Status:  status,
-		Updated: len(updatedFiles),
+		Created: created,
+		Updated: updated,
 		Skipped: skipped,
-		Files:   updatedFiles,
+		Files:   changedFiles,
 		Failed:  failed,
 	}
 }
@@ -806,6 +916,7 @@ func (h *Handler) getAuthFileBatchImportTask(taskID string) (authFileBatchImport
 		Status:        task.Status,
 		TotalRows:     task.TotalRows,
 		ProcessedRows: task.ProcessedRows,
+		Created:       task.Created,
 		Updated:       task.Updated,
 		Skipped:       task.Skipped,
 		Failed:        task.Failed,
@@ -829,7 +940,7 @@ func cloneTaskTime(value *time.Time) *time.Time {
 	return &cloned
 }
 
-func (h *Handler) runAuthFilesBatchImportTask(taskID string, rows []authFileBatchImportRow) {
+func (h *Handler) runAuthFilesBatchImportTask(taskID string, rows []authFileBatchImportRow, createMissing bool) {
 	startedAt := time.Now().UTC()
 	h.batchTasksMu.Lock()
 	task := h.batchImportTasks[taskID]
@@ -852,12 +963,13 @@ func (h *Handler) runAuthFilesBatchImportTask(taskID string, rows []authFileBatc
 		}
 	}()
 
-	result := h.importAuthFilesBatch(context.Background(), rows, func(update *authFileBatchImportTask) {
+	result := h.importAuthFilesBatch(context.Background(), rows, createMissing, func(update *authFileBatchImportTask) {
 		h.batchTasksMu.Lock()
 		task := h.batchImportTasks[taskID]
 		if task != nil {
 			task.ProcessedRows = update.ProcessedRows
 			task.CurrentFile = update.CurrentFile
+			task.Created = update.Created
 			task.Updated = update.Updated
 			task.Skipped = update.Skipped
 			task.Failed = update.Failed
@@ -875,6 +987,7 @@ func (h *Handler) runAuthFilesBatchImportTask(taskID string, rows []authFileBatc
 		task.Status = authFileBatchImportTaskStatusCompleted
 		task.ProcessedRows = task.TotalRows
 		task.CurrentFile = ""
+		task.Created = result.Created
 		task.Updated = result.Updated
 		task.Skipped = result.Skipped
 		task.Failed = len(result.Failed)

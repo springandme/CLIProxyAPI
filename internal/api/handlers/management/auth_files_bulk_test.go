@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -453,6 +454,123 @@ func TestImportAuthFilesBatch_RejectsProviderMismatch(t *testing.T) {
 	}
 	if len(payload.Failed) != 1 {
 		t.Fatalf("expected one failed row, got %#v", payload.Failed)
+	}
+}
+
+func TestImportAuthFilesBatch_CreateMissingRestoresDeletedAuthFile(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	reqBody := `{
+		"create_missing": true,
+		"rows":[
+			{
+				"name":"restored-codex.json",
+				"expected_provider":"codex",
+				"expected_type":"codex",
+				"fields":{
+					"email":{"op":"set","value":"restored@example.com"},
+					"access_token":{"op":"set","value":"access-token"},
+					"refresh_token":{"op":"set","value":"refresh-token"},
+					"deno_proxy_host":{"op":"set","value":"https://relay.example.com"},
+					"websockets":{"op":"set","value":true}
+				}
+			}
+		]
+	}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/batch-import", bytes.NewBufferString(reqBody))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	h.ImportAuthFilesBatch(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected import status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	var payload authFileBatchImportResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("failed to decode import payload: %v", err)
+	}
+	if payload.Created != 1 || payload.Updated != 0 || payload.Skipped != 0 || len(payload.Failed) != 0 {
+		t.Fatalf("unexpected import payload: %#v", payload)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(authDir, "restored-codex.json"))
+	if err != nil {
+		t.Fatalf("failed to read restored auth file: %v", err)
+	}
+	var stored map[string]any
+	if err = json.Unmarshal(raw, &stored); err != nil {
+		t.Fatalf("failed to decode restored auth file: %v", err)
+	}
+	if got := stored["type"]; got != "codex" {
+		t.Fatalf("expected restored type codex, got %#v", got)
+	}
+	if got := stored["deno_proxy_host"]; got != "https://relay.example.com" {
+		t.Fatalf("expected deno relay host to be restored, got %#v", got)
+	}
+	if got := stored["websockets"]; got != true {
+		t.Fatalf("expected websockets true, got %#v", got)
+	}
+
+	auth, ok := manager.GetByID("restored-codex.json")
+	if !ok {
+		t.Fatalf("expected restored auth to be registered")
+	}
+	if auth.Provider != "codex" {
+		t.Fatalf("expected runtime auth provider codex, got %q", auth.Provider)
+	}
+	if auth.Attributes["deno_proxy_host"] != "https://relay.example.com" {
+		t.Fatalf("expected runtime auth deno relay host, got %q", auth.Attributes["deno_proxy_host"])
+	}
+}
+
+func TestImportAuthFilesBatch_CreateMissingRequiresExpectedType(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	reqBody := `{
+		"create_missing": true,
+		"rows":[
+			{
+				"name":"restored-codex.json",
+				"expected_provider":"codex",
+				"fields":{
+					"access_token":{"op":"set","value":"access-token"}
+				}
+			}
+		]
+	}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/batch-import", bytes.NewBufferString(reqBody))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	h.ImportAuthFilesBatch(ctx)
+
+	if rec.Code != http.StatusMultiStatus {
+		t.Fatalf("expected import status %d, got %d with body %s", http.StatusMultiStatus, rec.Code, rec.Body.String())
+	}
+
+	var payload authFileBatchImportResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("failed to decode import payload: %v", err)
+	}
+	if payload.Created != 0 || payload.Updated != 0 {
+		t.Fatalf("expected no created or updated files, got %#v", payload)
+	}
+	if len(payload.Failed) != 1 || !strings.Contains(payload.Failed[0].Error, "expected_type is required") {
+		t.Fatalf("unexpected failures: %#v", payload.Failed)
 	}
 }
 
