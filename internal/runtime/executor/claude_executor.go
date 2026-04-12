@@ -1528,14 +1528,12 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
 	return checkSystemInstructionsWithSigningMode(payload, strictMode, false, false, "2.1.63", "", "")
 }
 
-// checkSystemInstructionsWithSigningMode injects Claude Code-style system blocks:
-//
-//	system[0]: billing header (no cache_control)
-//	system[1]: agent identifier (cache_control ephemeral, scope=org)
-//	system[2]: core intro prompt (cache_control ephemeral, scope=global)
-//	system[3]: system instructions (no cache_control)
-//	system[4]: doing tasks (no cache_control)
-//	system[5]: user system messages moved to first user message
+// checkSystemInstructionsWithSigningMode injects billing/system prompt blocks.
+// For normal cloaking, keep the smaller legacy structure used by the upstream
+// tests: billing header + agent block, and preserve user system prompts in the
+// system array when strict mode is disabled. For OAuth cloaking, keep the
+// larger Claude Code-style prompt pack and move forwarded third-party system
+// instructions into the first user turn to reduce fingerprinting.
 func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, experimentalCCHSigning bool, oauthMode bool, version, entrypoint, workload string) []byte {
 	system := gjson.GetBytes(payload, "system")
 
@@ -1563,26 +1561,15 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 	billingText := generateBillingHeader(payload, experimentalCCHSigning, version, messageText, entrypoint, workload)
 	billingBlock := buildTextBlock(billingText, nil)
 
-	// Build system blocks matching real Claude Code structure.
-	// Important: Claude Code's internal cacheScope='org' does NOT serialize to
-	// scope='org' in the API request. Only scope='global' is sent explicitly.
-	// The system prompt prefix block is sent without cache_control.
-	agentBlock := buildTextBlock("You are Claude Code, Anthropic's official CLI for Claude.", nil)
-	staticPrompt := strings.Join([]string{
-		helps.ClaudeCodeIntro,
-		helps.ClaudeCodeSystem,
-		helps.ClaudeCodeDoingTasks,
-		helps.ClaudeCodeToneAndStyle,
-		helps.ClaudeCodeOutputEfficiency,
-	}, "\n\n")
-	staticBlock := buildTextBlock(staticPrompt, nil)
+	agentText := "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+	systemBlocks := []string{billingBlock}
+	if oauthMode {
+		agentText = "You are Claude Code, Anthropic's official CLI for Claude."
+	}
+	systemBlocks = append(systemBlocks, buildTextBlock(agentText, nil))
 
-	systemResult := "[" + billingBlock + "," + agentBlock + "," + staticBlock + "]"
-	payload, _ = sjson.SetRawBytes(payload, "system", []byte(systemResult))
-
-	// Collect user system instructions and prepend to first user message
+	var userSystemParts []string
 	if !strictMode {
-		var userSystemParts []string
 		if system.IsArray() {
 			system.ForEach(func(_, part gjson.Result) bool {
 				if part.Get("type").String() == "text" {
@@ -1596,17 +1583,32 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 		} else if system.Type == gjson.String && strings.TrimSpace(system.String()) != "" {
 			userSystemParts = append(userSystemParts, strings.TrimSpace(system.String()))
 		}
+	}
+
+	if oauthMode {
+		staticPrompt := strings.Join([]string{
+			helps.ClaudeCodeIntro,
+			helps.ClaudeCodeSystem,
+			helps.ClaudeCodeDoingTasks,
+			helps.ClaudeCodeToneAndStyle,
+			helps.ClaudeCodeOutputEfficiency,
+		}, "\n\n")
+		systemBlocks = append(systemBlocks, buildTextBlock(staticPrompt, nil))
+		payload, _ = sjson.SetRawBytes(payload, "system", []byte("["+strings.Join(systemBlocks, ",")+"]"))
 
 		if len(userSystemParts) > 0 {
-			combined := strings.Join(userSystemParts, "\n\n")
-			if oauthMode {
-				combined = sanitizeForwardedSystemPrompt(combined)
-			}
+			combined := sanitizeForwardedSystemPrompt(strings.Join(userSystemParts, "\n\n"))
 			if strings.TrimSpace(combined) != "" {
 				payload = prependToFirstUserMessage(payload, combined)
 			}
 		}
+		return payload
 	}
+
+	for _, part := range userSystemParts {
+		systemBlocks = append(systemBlocks, buildTextBlock(part, map[string]string{"type": "ephemeral"}))
+	}
+	payload, _ = sjson.SetRawBytes(payload, "system", []byte("["+strings.Join(systemBlocks, ",")+"]"))
 
 	return payload
 }
