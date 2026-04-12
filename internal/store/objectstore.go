@@ -188,6 +188,7 @@ func (s *ObjectTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (s
 			return "", err
 		}
 	case auth.Metadata != nil:
+		persistDisabledMetadata(auth)
 		raw, errMarshal := json.Marshal(auth.Metadata)
 		if errMarshal != nil {
 			return "", fmt.Errorf("object store: marshal metadata: %w", errMarshal)
@@ -582,12 +583,14 @@ func (s *ObjectTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Aut
 	if email := strings.TrimSpace(valueAsString(metadata["email"])); email != "" {
 		attr["email"] = email
 	}
+	disabled, status := authDisabledState(metadata)
 	auth := &cliproxyauth.Auth{
 		ID:               rel,
 		Provider:         provider,
 		FileName:         rel,
 		Label:            labelFor(metadata),
-		Status:           cliproxyauth.StatusActive,
+		Status:           status,
+		Disabled:         disabled,
 		Attributes:       attr,
 		Metadata:         metadata,
 		CreatedAt:        info.ModTime(),

@@ -218,6 +218,7 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 			return "", err
 		}
 	case auth.Metadata != nil:
+		persistDisabledMetadata(auth)
 		raw, errMarshal := json.Marshal(auth.Metadata)
 		if errMarshal != nil {
 			return "", fmt.Errorf("postgres store: marshal metadata: %w", errMarshal)
@@ -297,12 +298,14 @@ func (s *PostgresStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) 
 		if email := strings.TrimSpace(valueAsString(metadata["email"])); email != "" {
 			attr["email"] = email
 		}
+		disabled, status := authDisabledState(metadata)
 		auth := &cliproxyauth.Auth{
 			ID:               normalizeAuthID(id),
 			Provider:         provider,
 			FileName:         normalizeAuthID(id),
 			Label:            labelFor(metadata),
-			Status:           cliproxyauth.StatusActive,
+			Status:           status,
+			Disabled:         disabled,
 			Attributes:       attr,
 			Metadata:         metadata,
 			CreatedAt:        createdAt,
