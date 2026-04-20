@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/textproto"
 	"strings"
 	"time"
 
@@ -659,7 +658,7 @@ func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (
 	if refreshToken == "" {
 		return auth, nil
 	}
-	svc := claudeauth.NewClaudeAuth(e.cfg)
+	svc := claudeauth.NewClaudeAuthWithProxyURL(e.cfg, auth.ProxyURL)
 	td, err := svc.RefreshTokens(ctx, refreshToken)
 	if err != nil {
 		return nil, err
@@ -911,15 +910,8 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		baseBetas += ",interleaved-thinking-2025-05-14"
 	}
 
-	hasClaude1MHeader := false
-	if ginHeaders != nil {
-		if _, ok := ginHeaders[textproto.CanonicalMIMEHeaderKey("X-CPA-CLAUDE-1M")]; ok {
-			hasClaude1MHeader = true
-		}
-	}
-
 	// Merge extra betas from request body and request flags.
-	if len(extraBetas) > 0 || hasClaude1MHeader {
+	if len(extraBetas) > 0 {
 		existingSet := make(map[string]bool)
 		for _, b := range strings.Split(baseBetas, ",") {
 			betaName := strings.TrimSpace(b)
@@ -933,9 +925,6 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 				baseBetas += "," + beta
 				existingSet[beta] = true
 			}
-		}
-		if hasClaude1MHeader && !existingSet["context-1m-2025-08-07"] {
-			baseBetas += ",context-1m-2025-08-07"
 		}
 	}
 	r.Header.Set("Anthropic-Beta", baseBetas)
@@ -1528,12 +1517,11 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
 	return checkSystemInstructionsWithSigningMode(payload, strictMode, false, false, "2.1.63", "", "")
 }
 
-// checkSystemInstructionsWithSigningMode injects billing/system prompt blocks.
-// For normal cloaking, keep the smaller legacy structure used by the upstream
-// tests: billing header + agent block, and preserve user system prompts in the
-// system array when strict mode is disabled. For OAuth cloaking, keep the
-// larger Claude Code-style prompt pack and move forwarded third-party system
-// instructions into the first user turn to reduce fingerprinting.
+// checkSystemInstructionsWithSigningMode injects the Claude Code-style billing
+// and static prompt blocks. When strict mode is disabled, user-provided system
+// prompts are forwarded into the first user turn instead of staying in the
+// system array. OAuth cloaking keeps the same structure but sanitizes the
+// forwarded third-party system prompt content.
 func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, experimentalCCHSigning bool, oauthMode bool, version, entrypoint, workload string) []byte {
 	system := gjson.GetBytes(payload, "system")
 
@@ -1560,13 +1548,19 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 
 	billingText := generateBillingHeader(payload, experimentalCCHSigning, version, messageText, entrypoint, workload)
 	billingBlock := buildTextBlock(billingText, nil)
-
-	agentText := "You are a Claude agent, built on Anthropic's Claude Agent SDK."
-	systemBlocks := []string{billingBlock}
-	if oauthMode {
-		agentText = "You are Claude Code, Anthropic's official CLI for Claude."
+	staticPrompt := strings.Join([]string{
+		helps.ClaudeCodeIntro,
+		helps.ClaudeCodeSystem,
+		helps.ClaudeCodeDoingTasks,
+		helps.ClaudeCodeToneAndStyle,
+		helps.ClaudeCodeOutputEfficiency,
+	}, "\n\n")
+	systemBlocks := []string{
+		billingBlock,
+		buildTextBlock("You are Claude Code, Anthropic's official CLI for Claude.", nil),
+		buildTextBlock(staticPrompt, nil),
 	}
-	systemBlocks = append(systemBlocks, buildTextBlock(agentText, nil))
+	payload, _ = sjson.SetRawBytes(payload, "system", []byte("["+strings.Join(systemBlocks, ",")+"]"))
 
 	var userSystemParts []string
 	if !strictMode {
@@ -1585,30 +1579,15 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 		}
 	}
 
-	if oauthMode {
-		staticPrompt := strings.Join([]string{
-			helps.ClaudeCodeIntro,
-			helps.ClaudeCodeSystem,
-			helps.ClaudeCodeDoingTasks,
-			helps.ClaudeCodeToneAndStyle,
-			helps.ClaudeCodeOutputEfficiency,
-		}, "\n\n")
-		systemBlocks = append(systemBlocks, buildTextBlock(staticPrompt, nil))
-		payload, _ = sjson.SetRawBytes(payload, "system", []byte("["+strings.Join(systemBlocks, ",")+"]"))
-
-		if len(userSystemParts) > 0 {
-			combined := sanitizeForwardedSystemPrompt(strings.Join(userSystemParts, "\n\n"))
-			if strings.TrimSpace(combined) != "" {
-				payload = prependToFirstUserMessage(payload, combined)
-			}
+	if len(userSystemParts) > 0 {
+		combined := strings.Join(userSystemParts, "\n\n")
+		if oauthMode {
+			combined = sanitizeForwardedSystemPrompt(combined)
 		}
-		return payload
+		if strings.TrimSpace(combined) != "" {
+			payload = prependToFirstUserMessage(payload, combined)
+		}
 	}
-
-	for _, part := range userSystemParts {
-		systemBlocks = append(systemBlocks, buildTextBlock(part, map[string]string{"type": "ephemeral"}))
-	}
-	payload, _ = sjson.SetRawBytes(payload, "system", []byte("["+strings.Join(systemBlocks, ",")+"]"))
 
 	return payload
 }
