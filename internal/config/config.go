@@ -102,6 +102,9 @@ type Config struct {
 	// Codex defines a list of Codex API key configurations as specified in the YAML configuration file.
 	CodexKey []CodexKey `yaml:"codex-api-key" json:"codex-api-key"`
 
+	// DenoProxies stores managed Codex relay hosts as absolute origins.
+	DenoProxies []string `yaml:"deno-proxies,omitempty" json:"deno-proxies,omitempty"`
+
 	// CodexHeaderDefaults configures fallback headers for Codex OAuth model requests.
 	// These are used only when the client does not send its own headers.
 	CodexHeaderDefaults CodexHeaderDefaults `yaml:"codex-header-defaults" json:"codex-header-defaults"`
@@ -680,6 +683,12 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Sanitize Codex keys: drop entries without base-url
 	cfg.SanitizeCodexKeys()
+
+	normalizedDenoProxies, errNormalizeDenoProxies := NormalizeDenoProxyHosts(cfg.DenoProxies)
+	if errNormalizeDenoProxies != nil {
+		return nil, fmt.Errorf("invalid deno-proxies: %w", errNormalizeDenoProxies)
+	}
+	cfg.DenoProxies = normalizedDenoProxies
 
 	// Sanitize Codex header defaults.
 	cfg.SanitizeCodexHeaderDefaults()

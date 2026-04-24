@@ -610,6 +610,12 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/codex-api-key", s.mgmt.PatchCodexKey)
 		mgmt.DELETE("/codex-api-key", s.mgmt.DeleteCodexKey)
 
+		mgmt.GET("/deno-proxies", s.mgmt.GetDenoProxies)
+		mgmt.PUT("/deno-proxies", s.mgmt.PutDenoProxies)
+		mgmt.PATCH("/deno-proxies", s.mgmt.PatchDenoProxies)
+		mgmt.DELETE("/deno-proxies", s.mgmt.DeleteDenoProxies)
+		mgmt.POST("/deno-proxies/probe", s.mgmt.ProbeDenoProxy)
+
 		mgmt.GET("/openai-compatibility", s.mgmt.GetOpenAICompat)
 		mgmt.PUT("/openai-compatibility", s.mgmt.PutOpenAICompat)
 		mgmt.PATCH("/openai-compatibility", s.mgmt.PatchOpenAICompat)
