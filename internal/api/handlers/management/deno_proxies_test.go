@@ -189,6 +189,9 @@ func TestGetDenoProxies_AggregatesUsageAndUnmanaged(t *testing.T) {
 	if !resp.Items[1].Unused || resp.Items[1].Host != "https://unused.example.com" {
 		t.Fatalf("unused item = %#v", resp.Items[1])
 	}
+	if resp.Items[1].UsedBy == nil || len(resp.Items[1].UsedBy) != 0 {
+		t.Fatalf("unused used_by = %#v, want empty slice", resp.Items[1].UsedBy)
+	}
 	if len(resp.UnmanagedInUse) != 2 {
 		t.Fatalf("len(resp.UnmanagedInUse) = %d, want 2", len(resp.UnmanagedInUse))
 	}

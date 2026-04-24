@@ -114,7 +114,7 @@ func (a *denoProxyUsageAggregate) item() denoProxyUsageItem {
 	return denoProxyUsageItem{
 		Host:       a.host,
 		UsageCount: len(a.usedBy),
-		UsedBy:     append([]denoProxyUsageRef(nil), a.usedBy...),
+		UsedBy:     append([]denoProxyUsageRef{}, a.usedBy...),
 		Unused:     len(a.usedBy) == 0,
 	}
 }
