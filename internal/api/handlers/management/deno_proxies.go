@@ -527,7 +527,7 @@ func readAuthFileDenoProxyHost(data []byte) string {
 func collectDenoProxyUsageRefsFromRuntimeAuths(auths []*coreauth.Auth) []denoProxyUsageRefWithHost {
 	refs := make([]denoProxyUsageRefWithHost, 0, len(auths))
 	for _, auth := range auths {
-		if auth == nil {
+		if shouldSkipRuntimeAuthDenoProxyUsage(auth) {
 			continue
 		}
 		host := runtimeAuthDenoProxyHost(auth)
@@ -564,6 +564,29 @@ func collectDenoProxyUsageRefsFromRuntimeAuths(auths []*coreauth.Auth) []denoPro
 		})
 	}
 	return refs
+}
+
+func shouldSkipRuntimeAuthDenoProxyUsage(auth *coreauth.Auth) bool {
+	if auth == nil {
+		return true
+	}
+	if isRuntimeOnlyAuth(auth) {
+		return false
+	}
+
+	path := strings.TrimSpace(authAttribute(auth, "path"))
+	if path == "" {
+		return false
+	}
+	if _, err := os.Stat(path); err == nil {
+		return false
+	} else if !os.IsNotExist(err) {
+		return false
+	}
+
+	return auth.Disabled ||
+		auth.Status == coreauth.StatusDisabled ||
+		strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "removed via management api")
 }
 
 func runtimeAuthDenoProxyHost(auth *coreauth.Auth) string {

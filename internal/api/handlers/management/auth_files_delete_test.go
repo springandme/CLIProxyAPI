@@ -99,6 +99,86 @@ func TestDeleteAuthFile_UsesAuthPathFromManager(t *testing.T) {
 	}
 }
 
+func TestDeleteAuthFile_RemovesDenoProxyUsageFromDeletedAuth(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	tempDir := t.TempDir()
+	authDir := filepath.Join(tempDir, "auth")
+	if errMkdirAuth := os.MkdirAll(authDir, 0o700); errMkdirAuth != nil {
+		t.Fatalf("failed to create auth dir: %v", errMkdirAuth)
+	}
+
+	fileName := "codex-user@example.com.json"
+	filePath := filepath.Join(authDir, fileName)
+	if errWrite := os.WriteFile(filePath, []byte(`{"type":"codex","email":"e8fh0wqp@amazo.indevs.in","deno_proxy_host":"https://careful-oyster-29.jacyheviken-tech.deno.net"}`), 0o600); errWrite != nil {
+		t.Fatalf("failed to write auth file: %v", errWrite)
+	}
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "legacy/" + fileName,
+		FileName: fileName,
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": filePath,
+		},
+		Metadata: map[string]any{
+			"type":            "codex",
+			"email":           "e8fh0wqp@amazo.indevs.in",
+			"deno_proxy_host": "https://careful-oyster-29.jacyheviken-tech.deno.net",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{
+		AuthDir: authDir,
+		DenoProxies: []string{
+			"https://careful-oyster-29.jacyheviken-tech.deno.net",
+		},
+	}, manager)
+	h.tokenStore = &memoryAuthStore{}
+
+	deleteRec := httptest.NewRecorder()
+	deleteCtx, _ := gin.CreateTestContext(deleteRec)
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/v0/management/auth-files?name="+url.QueryEscape(fileName), nil)
+	deleteCtx.Request = deleteReq
+	h.DeleteAuthFile(deleteCtx)
+
+	if deleteRec.Code != http.StatusOK {
+		t.Fatalf("expected delete status %d, got %d with body %s", http.StatusOK, deleteRec.Code, deleteRec.Body.String())
+	}
+
+	listRec := httptest.NewRecorder()
+	listCtx, _ := gin.CreateTestContext(listRec)
+	listReq := httptest.NewRequest(http.MethodGet, "/v0/management/deno-proxies", nil)
+	listCtx.Request = listReq
+	h.GetDenoProxies(listCtx)
+
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("expected deno proxies status %d, got %d with body %s", http.StatusOK, listRec.Code, listRec.Body.String())
+	}
+
+	var resp denoProxyListResponse
+	if errUnmarshal := json.Unmarshal(listRec.Body.Bytes(), &resp); errUnmarshal != nil {
+		t.Fatalf("failed to decode deno proxy payload: %v", errUnmarshal)
+	}
+	if len(resp.Items) != 1 {
+		t.Fatalf("expected 1 managed deno proxy item, got %d", len(resp.Items))
+	}
+	if resp.Items[0].UsageCount != 0 {
+		t.Fatalf("expected deleted auth usage to be removed, got usage_count=%d", resp.Items[0].UsageCount)
+	}
+	if len(resp.Items[0].UsedBy) != 0 {
+		t.Fatalf("expected deleted auth used_by to be empty, got %#v", resp.Items[0].UsedBy)
+	}
+	if len(resp.UnmanagedInUse) != 0 {
+		t.Fatalf("expected no unmanaged usage after delete, got %#v", resp.UnmanagedInUse)
+	}
+}
+
 func TestDeleteAuthFile_FallbackToAuthDirPath(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
