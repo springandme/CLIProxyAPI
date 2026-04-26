@@ -182,7 +182,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body = normalizeCodexInstructions(body)
-	body = ensureImageGenerationTool(body, baseModel)
+	body = ensureImageGenerationTool(body, baseModel, auth)
 
 	url := applyCodexDenoProxy(auth, strings.TrimSuffix(baseURL, "/")+"/responses")
 	httpReq, continuity, err := e.cacheHelper(ctx, auth, from, url, req, opts, body)
@@ -330,7 +330,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.DeleteBytes(body, "stream")
 	body = normalizeCodexInstructions(body)
-	body = ensureImageGenerationTool(body, baseModel)
+	body = ensureImageGenerationTool(body, baseModel, auth)
 
 	url := applyCodexDenoProxy(auth, strings.TrimSuffix(baseURL, "/")+"/responses/compact")
 	httpReq, continuity, err := e.cacheHelper(ctx, auth, from, url, req, opts, body)
@@ -425,7 +425,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body = normalizeCodexInstructions(body)
-	body = ensureImageGenerationTool(body, baseModel)
+	body = ensureImageGenerationTool(body, baseModel, auth)
 
 	url := applyCodexDenoProxy(auth, strings.TrimSuffix(baseURL, "/")+"/responses")
 	httpReq, continuity, err := e.cacheHelper(ctx, auth, from, url, req, opts, body)
@@ -829,8 +829,21 @@ func normalizeCodexInstructions(body []byte) []byte {
 var imageGenToolJSON = []byte(`{"type":"image_generation","output_format":"png"}`)
 var imageGenToolArrayJSON = []byte(`[{"type":"image_generation","output_format":"png"}]`)
 
-func ensureImageGenerationTool(body []byte, baseModel string) []byte {
+func isCodexFreePlanAuth(auth *cliproxyauth.Auth) bool {
+	if auth == nil || auth.Attributes == nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(auth.Attributes["plan_type"]), "free")
+}
+
+func ensureImageGenerationTool(body []byte, baseModel string, auth *cliproxyauth.Auth) []byte {
 	if strings.HasSuffix(baseModel, "spark") {
+		return body
+	}
+	if isCodexFreePlanAuth(auth) {
 		return body
 	}
 
