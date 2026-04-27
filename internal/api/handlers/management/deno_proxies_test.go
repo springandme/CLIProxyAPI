@@ -183,8 +183,8 @@ func TestGetDenoProxies_AggregatesUsageAndUnmanaged(t *testing.T) {
 	if resp.Items[0].Host != "https://managed.example.com" {
 		t.Fatalf("managed host = %q", resp.Items[0].Host)
 	}
-	if resp.Items[0].UsageCount != 3 {
-		t.Fatalf("managed usage_count = %d, want 3", resp.Items[0].UsageCount)
+	if resp.Items[0].UsageCount != 2 {
+		t.Fatalf("managed usage_count = %d, want 2", resp.Items[0].UsageCount)
 	}
 	if !resp.Items[1].Unused || resp.Items[1].Host != "https://unused.example.com" {
 		t.Fatalf("unused item = %#v", resp.Items[1])

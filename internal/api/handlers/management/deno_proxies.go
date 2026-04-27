@@ -313,7 +313,8 @@ func (h *Handler) buildDenoProxyListResponse() denoProxyListResponse {
 	}
 
 	runtimeLookup := buildRuntimeAuthLookup(auths)
-	for _, refWithHost := range collectDenoProxyUsageRefsFromAuthFiles(authDir, runtimeLookup.fileAuthIndex) {
+	authFileRefs := collectDenoProxyUsageRefsFromAuthFiles(authDir, runtimeLookup.fileAuthIndex)
+	for _, refWithHost := range authFileRefs {
 		aggregate := usageByHost[refWithHost.host]
 		if aggregate == nil {
 			aggregate = newDenoProxyUsageAggregate(refWithHost.host)
@@ -321,7 +322,12 @@ func (h *Handler) buildDenoProxyListResponse() denoProxyListResponse {
 		}
 		aggregate.add(refWithHost.ref)
 	}
+
+	fileBackedUsageKeys := buildDenoProxyFileBackedUsageKeySet(authFileRefs)
 	for _, refWithHost := range collectDenoProxyUsageRefsFromRuntimeAuths(auths) {
+		if shouldSkipRuntimeAuthUsageRef(refWithHost, fileBackedUsageKeys) {
+			continue
+		}
 		aggregate := usageByHost[refWithHost.host]
 		if aggregate == nil {
 			aggregate = newDenoProxyUsageAggregate(refWithHost.host)
@@ -370,6 +376,56 @@ func (h *Handler) buildDenoProxyListResponse() denoProxyListResponse {
 		UnmanagedHosts:  unmanagedHosts,
 		TotalUsageCount: totalUsageCount,
 	}
+}
+
+func buildDenoProxyFileBackedUsageKeySet(
+	refs []denoProxyUsageRefWithHost,
+) map[string]struct{} {
+	keys := make(map[string]struct{}, len(refs)*2)
+	for _, refWithHost := range refs {
+		addDenoProxyUsageLookupKeys(keys, refWithHost.host, refWithHost.ref)
+	}
+	return keys
+}
+
+func shouldSkipRuntimeAuthUsageRef(
+	refWithHost denoProxyUsageRefWithHost,
+	fileBackedKeys map[string]struct{},
+) bool {
+	if refWithHost.ref.RuntimeOnly {
+		return false
+	}
+	if len(fileBackedKeys) == 0 {
+		return false
+	}
+	for _, key := range denoProxyUsageLookupKeys(refWithHost.host, refWithHost.ref) {
+		if _, exists := fileBackedKeys[key]; exists {
+			return true
+		}
+	}
+	return false
+}
+
+func addDenoProxyUsageLookupKeys(keys map[string]struct{}, host string, ref denoProxyUsageRef) {
+	for _, key := range denoProxyUsageLookupKeys(host, ref) {
+		keys[key] = struct{}{}
+	}
+}
+
+func denoProxyUsageLookupKeys(host string, ref denoProxyUsageRef) []string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return nil
+	}
+
+	keys := make([]string, 0, 2)
+	if authIndex := strings.TrimSpace(ref.AuthIndex); authIndex != "" {
+		keys = append(keys, host+"|auth-index|"+authIndex)
+	}
+	if fileName := strings.TrimSpace(ref.FileName); fileName != "" {
+		keys = append(keys, host+"|file-name|"+filepath.Base(fileName))
+	}
+	return keys
 }
 
 func (h *Handler) snapshotDenoProxySources() ([]string, string, []*coreauth.Auth, []config.CodexKey) {
