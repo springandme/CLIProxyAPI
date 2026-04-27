@@ -144,6 +144,15 @@ func TestGetDenoProxies_AggregatesUsageAndUnmanaged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("manager.Register(runtime auth) error = %v", err)
 	}
+	_, err = manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "codex-runtime-shadow",
+		Provider: "codex",
+		Label:    "user@example.com",
+		Metadata: map[string]any{"email": "user@example.com", "deno_proxy_host": "https://managed.example.com"},
+	})
+	if err != nil {
+		t.Fatalf("manager.Register(runtime shadow auth) error = %v", err)
+	}
 
 	h := &Handler{
 		cfg: &config.Config{

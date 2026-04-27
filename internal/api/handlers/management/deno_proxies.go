@@ -88,11 +88,15 @@ func (a *denoProxyUsageAggregate) add(ref denoProxyUsageRef) {
 	if a == nil {
 		return
 	}
-	key := denoProxyUsageRefKey(ref)
-	if _, exists := a.seen[key]; exists {
-		return
+	keys := denoProxyUsageRefKeys(ref)
+	for _, key := range keys {
+		if _, exists := a.seen[key]; exists {
+			return
+		}
 	}
-	a.seen[key] = struct{}{}
+	for _, key := range keys {
+		a.seen[key] = struct{}{}
+	}
 	a.usedBy = append(a.usedBy, ref)
 }
 
@@ -119,8 +123,25 @@ func (a *denoProxyUsageAggregate) item() denoProxyUsageItem {
 	}
 }
 
-func denoProxyUsageRefKey(ref denoProxyUsageRef) string {
-	return strings.Join([]string{
+func denoProxyUsageRefKeys(ref denoProxyUsageRef) []string {
+	provider := strings.ToLower(strings.TrimSpace(ref.Provider))
+	keys := make([]string, 0, 4)
+	if authIndex := strings.TrimSpace(ref.AuthIndex); authIndex != "" {
+		keys = append(keys, "auth-index|"+provider+"|"+authIndex)
+	}
+	if fileName := strings.TrimSpace(ref.FileName); fileName != "" {
+		keys = append(keys, "file-name|"+provider+"|"+strings.ToLower(filepath.Base(fileName)))
+	}
+	if label := strings.TrimSpace(ref.Label); label != "" {
+		keys = append(keys, "label|"+provider+"|"+strings.ToLower(label))
+	}
+	if name := strings.TrimSpace(ref.Name); name != "" {
+		keys = append(keys, "name|"+provider+"|"+strings.ToLower(name))
+	}
+	if len(keys) > 0 {
+		return keys
+	}
+	return []string{strings.Join([]string{
 		ref.Source,
 		ref.ID,
 		ref.Name,
@@ -129,7 +150,7 @@ func denoProxyUsageRefKey(ref denoProxyUsageRef) string {
 		ref.AuthIndex,
 		ref.BaseURL,
 		ref.Prefix,
-	}, "|")
+	}, "|")}
 }
 
 func (h *Handler) GetDenoProxies(c *gin.Context) {
