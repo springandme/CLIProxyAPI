@@ -162,6 +162,7 @@ type authFallbackExecutor struct {
 	streamCalls       []string
 	executeErrors     map[string]error
 	streamFirstErrors map[string]error
+	streamFinalErrors map[string]error
 }
 
 func (e *authFallbackExecutor) Identifier() string {
@@ -185,13 +186,20 @@ func (e *authFallbackExecutor) ExecuteStream(_ context.Context, auth *Auth, _ cl
 	err := e.streamFirstErrors[auth.ID]
 	e.mu.Unlock()
 
-	ch := make(chan cliproxyexecutor.StreamChunk, 1)
+	bufferSize := 1
+	if e.streamFinalErrors[auth.ID] != nil {
+		bufferSize = 2
+	}
+	ch := make(chan cliproxyexecutor.StreamChunk, bufferSize)
 	if err != nil {
 		ch <- cliproxyexecutor.StreamChunk{Err: err}
 		close(ch)
 		return &cliproxyexecutor.StreamResult{Headers: http.Header{"X-Auth": {auth.ID}}, Chunks: ch}, nil
 	}
 	ch <- cliproxyexecutor.StreamChunk{Payload: []byte(auth.ID)}
+	if err := e.streamFinalErrors[auth.ID]; err != nil {
+		ch <- cliproxyexecutor.StreamChunk{Err: err}
+	}
 	close(ch)
 	return &cliproxyexecutor.StreamResult{Headers: http.Header{"X-Auth": {auth.ID}}, Chunks: ch}, nil
 }
@@ -738,6 +746,143 @@ func TestManager_Execute_DisableCooling_RetriesAfter429RetryAfter(t *testing.T) 
 	calls := executor.ExecuteCalls()
 	if len(calls) != 4 {
 		t.Fatalf("execute calls = %d, want 4 (initial + 3 retries)", len(calls))
+	}
+}
+
+func TestManagerExecuteStream_PropagatesRetryAfterFromPostBootstrapChunkError(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	m := NewManager(nil, nil, nil)
+	retryAfter := 2 * time.Minute
+	executor := &authFallbackExecutor{
+		id: "codex",
+		streamFinalErrors: map[string]error{
+			"codex-ws-quota": &retryAfterStatusError{
+				status:     http.StatusTooManyRequests,
+				message:    "usage limit reached",
+				retryAfter: retryAfter,
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "gpt-5-codex"
+	auth := &Auth{ID: "codex-ws-quota", Provider: "codex", Attributes: map[string]string{"websockets": "true"}}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	start := time.Now()
+	streamResult, errExecute := m.ExecuteStream(cliproxyexecutor.WithDownstreamWebsocket(context.Background()), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("execute stream error = %v", errExecute)
+	}
+	var gotErr error
+	for chunk := range streamResult.Chunks {
+		if chunk.Err != nil {
+			gotErr = chunk.Err
+		}
+	}
+	if gotErr == nil {
+		t.Fatal("expected terminal stream error")
+	}
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	state := updated.ModelStates[model]
+	if state == nil {
+		t.Fatalf("expected model state for %q", model)
+	}
+	if !state.Unavailable {
+		t.Fatalf("expected auth model state to be unavailable")
+	}
+	minNext := start.Add(retryAfter).Add(-2 * time.Second)
+	maxNext := start.Add(retryAfter).Add(2 * time.Second)
+	if state.NextRetryAfter.Before(minNext) || state.NextRetryAfter.After(maxNext) {
+		t.Fatalf("NextRetryAfter = %v, want near %v", state.NextRetryAfter, start.Add(retryAfter))
+	}
+	if !state.Quota.Exceeded {
+		t.Fatalf("expected quota state to be marked exceeded")
+	}
+}
+
+func TestManagerExecuteStream_WebsocketCooldownFallsBackToHTTPOnlyAuth(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	m := NewManager(nil, nil, nil)
+	executor := &authFallbackExecutor{
+		id: "codex",
+		streamFinalErrors: map[string]error{
+			"aa-codex-ws-quota": &retryAfterStatusError{
+				status:     http.StatusTooManyRequests,
+				message:    "usage limit reached",
+				retryAfter: 10 * time.Minute,
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "gpt-5-codex"
+	wsAuth := &Auth{ID: "aa-codex-ws-quota", Provider: "codex", Attributes: map[string]string{"websockets": "true"}}
+	httpAuth := &Auth{ID: "bb-codex-http-ok", Provider: "codex"}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(wsAuth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(httpAuth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(wsAuth.ID)
+		reg.UnregisterClient(httpAuth.ID)
+	})
+
+	if _, errRegister := m.Register(context.Background(), wsAuth); errRegister != nil {
+		t.Fatalf("register websocket auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), httpAuth); errRegister != nil {
+		t.Fatalf("register http auth: %v", errRegister)
+	}
+
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+	request := cliproxyexecutor.Request{Model: model}
+	first, errFirst := m.ExecuteStream(ctx, []string{"codex"}, request, cliproxyexecutor.Options{})
+	if errFirst != nil {
+		t.Fatalf("first execute stream error = %v", errFirst)
+	}
+	for range first.Chunks {
+	}
+
+	second, errSecond := m.ExecuteStream(ctx, []string{"codex"}, request, cliproxyexecutor.Options{})
+	if errSecond != nil {
+		t.Fatalf("second execute stream error = %v", errSecond)
+	}
+	var payload []byte
+	for chunk := range second.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("second stream chunk error = %v", chunk.Err)
+		}
+		payload = append(payload, chunk.Payload...)
+	}
+	if string(payload) != httpAuth.ID {
+		t.Fatalf("second payload = %q, want %q", string(payload), httpAuth.ID)
+	}
+
+	got := executor.StreamCalls()
+	want := []string{wsAuth.ID, httpAuth.ID}
+	if len(got) != len(want) {
+		t.Fatalf("stream calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("stream call %d auth = %q, want %q", i, got[i], want[i])
+		}
 	}
 }
 

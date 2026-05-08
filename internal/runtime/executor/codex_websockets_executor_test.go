@@ -92,6 +92,94 @@ func TestCodexWebsocketsExecutePreservesPreviousResponseIDUpstream(t *testing.T)
 	}
 }
 
+func TestCodexWebsocketsExecuteReconnectsWhenSessionAuthChanges(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	capturedAuth := make(chan string, 2)
+	done := make(chan struct{})
+	defer close(done)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("request path = %s, want /responses", r.URL.Path)
+		}
+		capturedAuth <- r.Header.Get("Authorization")
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upgrade websocket: %v", err)
+		}
+		defer func() { _ = conn.Close() }()
+
+		for {
+			msgType, _, errRead := conn.ReadMessage()
+			if errRead != nil {
+				return
+			}
+			if msgType != websocket.TextMessage {
+				t.Fatalf("message type = %d, want text", msgType)
+			}
+			completed := []byte(`{"type":"response.completed","response":{"id":"resp-ok","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`)
+			if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+				return
+			}
+			select {
+			case <-done:
+				return
+			default:
+			}
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	sessionID := "test-auth-switch-" + time.Now().Format("150405.000000000")
+	defer exec.CloseExecutionSession(sessionID)
+
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: []byte(`{"model":"gpt-5-codex","input":[{"type":"message","content":"hello"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("codex"),
+		Metadata:     map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: sessionID},
+	}
+
+	auth1 := &cliproxyauth.Auth{ID: "auth-token-1", Attributes: map[string]string{"api_key": "token-1", "base_url": server.URL}}
+	if _, err := exec.Execute(context.Background(), auth1, req, opts); err != nil {
+		t.Fatalf("first Execute() error = %v", err)
+	}
+	if got := readAuthHeader(t, capturedAuth); got != "Bearer token-1" {
+		t.Fatalf("first Authorization = %q, want Bearer token-1", got)
+	}
+
+	auth2 := &cliproxyauth.Auth{ID: "auth-token-2", Attributes: map[string]string{"api_key": "token-2", "base_url": server.URL}}
+	if _, err := exec.Execute(context.Background(), auth2, req, opts); err != nil {
+		t.Fatalf("second Execute() error = %v", err)
+	}
+	if got := readAuthHeader(t, capturedAuth); got != "Bearer token-2" {
+		t.Fatalf("second Authorization = %q, want Bearer token-2", got)
+	}
+}
+
+func readAuthHeader(t *testing.T, ch <-chan string) string {
+	t.Helper()
+	select {
+	case got := <-ch:
+		return got
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for upstream websocket authorization header")
+		return ""
+	}
+}
+
+func TestSendCodexWebsocketReadClosedChannelDoesNotPanic(t *testing.T) {
+	ch := make(chan codexWebsocketRead)
+	close(ch)
+
+	if sendCodexWebsocketRead(ch, nil, codexWebsocketRead{msgType: websocket.TextMessage, payload: []byte(`{}`)}, true) {
+		t.Fatal("expected send to closed channel to report false")
+	}
+}
+
 func TestApplyCodexWebsocketHeadersDefaultsToCurrentResponsesBeta(t *testing.T) {
 	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, nil, "", nil)
 

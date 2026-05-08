@@ -1293,6 +1293,27 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	sess.connMu.Lock()
 	conn := sess.conn
 	readerConn := sess.readerConn
+	currentAuthID := sess.authID
+	currentWSURL := sess.wsURL
+	sess.connMu.Unlock()
+	if conn != nil {
+		if currentAuthID != authID || currentWSURL != wsURL {
+			e.invalidateUpstreamConn(sess, conn, "auth_or_url_changed", nil)
+		} else {
+			if readerConn != conn {
+				sess.connMu.Lock()
+				sess.readerConn = conn
+				sess.connMu.Unlock()
+				sess.configureConn(conn)
+				go e.readUpstreamLoop(sess, conn)
+			}
+			return conn, nil, nil
+		}
+	}
+
+	sess.connMu.Lock()
+	conn = sess.conn
+	readerConn = sess.readerConn
 	sess.connMu.Unlock()
 	if conn != nil {
 		if readerConn != conn {
@@ -1331,6 +1352,33 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	return conn, resp, nil
 }
 
+func sendCodexWebsocketRead(ch chan codexWebsocketRead, done <-chan struct{}, ev codexWebsocketRead, block bool) (sent bool) {
+	if ch == nil {
+		return false
+	}
+	defer func() {
+		if recover() != nil {
+			sent = false
+		}
+	}()
+	if block {
+		select {
+		case ch <- ev:
+			return true
+		case <-done:
+			return false
+		}
+	}
+	select {
+	case ch <- ev:
+		return true
+	case <-done:
+		return false
+	default:
+		return false
+	}
+}
+
 func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, conn *websocket.Conn) {
 	if e == nil || sess == nil || conn == nil {
 		return
@@ -1344,13 +1392,8 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 			done := sess.activeDone
 			sess.activeMu.Unlock()
 			if ch != nil {
-				select {
-				case ch <- codexWebsocketRead{conn: conn, err: errRead}:
-				case <-done:
-				default:
-				}
+				sendCodexWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errRead}, true)
 				sess.clearActive(ch)
-				close(ch)
 			}
 			e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
 			return
@@ -1364,13 +1407,8 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 				done := sess.activeDone
 				sess.activeMu.Unlock()
 				if ch != nil {
-					select {
-					case ch <- codexWebsocketRead{conn: conn, err: errBinary}:
-					case <-done:
-					default:
-					}
+					sendCodexWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errBinary}, true)
 					sess.clearActive(ch)
-					close(ch)
 				}
 				e.invalidateUpstreamConn(sess, conn, "unexpected_binary", errBinary)
 				return
@@ -1385,10 +1423,7 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 		if ch == nil {
 			continue
 		}
-		select {
-		case ch <- codexWebsocketRead{conn: conn, msgType: msgType, payload: payload}:
-		case <-done:
-		}
+		sendCodexWebsocketRead(ch, done, codexWebsocketRead{conn: conn, msgType: msgType, payload: payload}, true)
 	}
 }
 
