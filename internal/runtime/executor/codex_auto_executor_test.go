@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"testing"
 
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 type stubCodexHTTPExecutor struct {
@@ -65,6 +65,10 @@ func (s *stubCodexWebsocketExecutor) ExecuteStream(_ context.Context, _ *cliprox
 }
 
 func (s *stubCodexWebsocketExecutor) CloseExecutionSession(string) {}
+
+func (s *stubCodexWebsocketExecutor) UpstreamDisconnectChan(string) <-chan error {
+	return nil
+}
 
 func TestCodexAutoExecutor_ExecuteSelectsExpectedTransport(t *testing.T) {
 	downstreamWS := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
