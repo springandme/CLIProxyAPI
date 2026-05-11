@@ -1193,7 +1193,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
 }
 
-// PatchAuthFileFields updates editable fields (prefix, proxy_url, headers, priority, note) of an auth file.
+// PatchAuthFileFields updates editable fields (prefix, proxy_url, headers, priority, note, websockets) of an auth file.
 func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	if h.authManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
@@ -1201,12 +1201,13 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 
 	var req struct {
-		Name     string            `json:"name"`
-		Prefix   *string           `json:"prefix"`
-		ProxyURL *string           `json:"proxy_url"`
-		Headers  map[string]string `json:"headers"`
-		Priority *int              `json:"priority"`
-		Note     *string           `json:"note"`
+		Name       string            `json:"name"`
+		Prefix     *string           `json:"prefix"`
+		ProxyURL   *string           `json:"proxy_url"`
+		Headers    map[string]string `json:"headers"`
+		Priority   *int              `json:"priority"`
+		Note       *string           `json:"note"`
+		Websockets *bool             `json:"websockets"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -1343,7 +1344,7 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 			changed = true
 		}
 	}
-	if req.Priority != nil || req.Note != nil {
+	if req.Priority != nil || req.Note != nil || req.Websockets != nil {
 		if targetAuth.Metadata == nil {
 			targetAuth.Metadata = make(map[string]any)
 		}
@@ -1369,6 +1370,10 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 				targetAuth.Metadata["note"] = trimmedNote
 				targetAuth.Attributes["note"] = trimmedNote
 			}
+		}
+		if req.Websockets != nil {
+			targetAuth.Metadata["websockets"] = *req.Websockets
+			targetAuth.Attributes["websockets"] = strconv.FormatBool(*req.Websockets)
 		}
 		changed = true
 	}

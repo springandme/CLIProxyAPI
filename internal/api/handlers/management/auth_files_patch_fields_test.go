@@ -162,3 +162,101 @@ func TestPatchAuthFileFields_HeadersEmptyMapIsNoop(t *testing.T) {
 		t.Fatalf("metadata.headers.X-Kee = %#v, want %q", got, "1")
 	}
 }
+
+func TestPatchAuthFileFields_WebsocketsFalseOnlyUpdatesField(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "codex.json",
+		FileName: "codex.json",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path":       "/tmp/codex.json",
+			"websockets": "true",
+		},
+		Metadata: map[string]any{
+			"type":       "codex",
+			"websockets": true,
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	body := `{"name":"codex.json","websockets":false}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID("codex.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record to exist after patch")
+	}
+	if got := updated.Attributes["websockets"]; got != "false" {
+		t.Fatalf("attrs websockets = %q, want false", got)
+	}
+	if got, ok := updated.Metadata["websockets"].(bool); !ok || got {
+		t.Fatalf("metadata.websockets = %#v, want false bool", updated.Metadata["websockets"])
+	}
+}
+
+func TestPatchAuthFileFields_WebsocketsTrueOnlyUpdatesField(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "codex-disabled-ws.json",
+		FileName: "codex-disabled-ws.json",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path":       "/tmp/codex-disabled-ws.json",
+			"websockets": "false",
+		},
+		Metadata: map[string]any{
+			"type":       "codex",
+			"websockets": false,
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	body := `{"name":"codex-disabled-ws.json","websockets":true}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID("codex-disabled-ws.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record to exist after patch")
+	}
+	if got := updated.Attributes["websockets"]; got != "true" {
+		t.Fatalf("attrs websockets = %q, want true", got)
+	}
+	if got, ok := updated.Metadata["websockets"].(bool); !ok || !got {
+		t.Fatalf("metadata.websockets = %#v, want true bool", updated.Metadata["websockets"])
+	}
+}
