@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	fileauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
@@ -163,7 +166,7 @@ func TestPatchAuthFileFields_HeadersEmptyMapIsNoop(t *testing.T) {
 	}
 }
 
-func TestPatchAuthFileFields_WebsocketsFalseOnlyUpdatesField(t *testing.T) {
+func TestPatchAuthFileFields_WebsocketsFalseIsUpdate(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
 
@@ -205,10 +208,10 @@ func TestPatchAuthFileFields_WebsocketsFalseOnlyUpdatesField(t *testing.T) {
 		t.Fatalf("expected auth record to exist after patch")
 	}
 	if got := updated.Attributes["websockets"]; got != "false" {
-		t.Fatalf("attrs websockets = %q, want false", got)
+		t.Fatalf("attrs websockets = %q, want %q", got, "false")
 	}
 	if got, ok := updated.Metadata["websockets"].(bool); !ok || got {
-		t.Fatalf("metadata.websockets = %#v, want false bool", updated.Metadata["websockets"])
+		t.Fatalf("metadata.websockets = %#v, want false", updated.Metadata["websockets"])
 	}
 }
 
@@ -254,9 +257,75 @@ func TestPatchAuthFileFields_WebsocketsTrueOnlyUpdatesField(t *testing.T) {
 		t.Fatalf("expected auth record to exist after patch")
 	}
 	if got := updated.Attributes["websockets"]; got != "true" {
-		t.Fatalf("attrs websockets = %q, want true", got)
+		t.Fatalf("attrs websockets = %q, want %q", got, "true")
 	}
 	if got, ok := updated.Metadata["websockets"].(bool); !ok || !got {
-		t.Fatalf("metadata.websockets = %#v, want true bool", updated.Metadata["websockets"])
+		t.Fatalf("metadata.websockets = %#v, want true", updated.Metadata["websockets"])
+	}
+}
+
+func TestPatchAuthFileFields_ArbitraryFieldsPersistToFile(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	fileName := "generic.json"
+	filePath := filepath.Join(authDir, fileName)
+	store := fileauth.NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": filePath,
+		},
+		Metadata: map[string]any{
+			"type": "codex",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	body := `{"name":"generic.json","abc":true,"nested.cde":true,"fgh":{"ijk":true}}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	raw, errRead := os.ReadFile(filePath)
+	if errRead != nil {
+		t.Fatalf("failed to read updated auth file: %v", errRead)
+	}
+	var data map[string]any
+	if errUnmarshal := json.Unmarshal(raw, &data); errUnmarshal != nil {
+		t.Fatalf("failed to unmarshal updated auth file: %v", errUnmarshal)
+	}
+	if got := data["abc"]; got != true {
+		t.Fatalf("abc = %#v, want true", got)
+	}
+	nested, ok := data["nested"].(map[string]any)
+	if !ok {
+		t.Fatalf("nested = %#v, want object", data["nested"])
+	}
+	if got := nested["cde"]; got != true {
+		t.Fatalf("nested.cde = %#v, want true", got)
+	}
+	fgh, ok := data["fgh"].(map[string]any)
+	if !ok {
+		t.Fatalf("fgh = %#v, want object", data["fgh"])
+	}
+	if got := fgh["ijk"]; got != true {
+		t.Fatalf("fgh.ijk = %#v, want true", got)
 	}
 }
