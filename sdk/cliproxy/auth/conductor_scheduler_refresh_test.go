@@ -215,3 +215,97 @@ func TestManager_PickNext_RebuildsSchedulerAfterModelCooldownError(t *testing.T)
 		t.Fatalf("pickNext() auth = %v, want %q", got, newAuth.ID)
 	}
 }
+
+func TestManager_RegisterPreservesActiveQuotaCooldown(t *testing.T) {
+	ctx := context.Background()
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.RegisterExecutor(schedulerProviderTestExecutor{provider: "codex"})
+
+	model := "gpt-5.5"
+	registerSchedulerModels(t, "codex", model, "aa-codex-quota", "bb-codex-ready")
+
+	if _, errRegister := manager.Register(ctx, &Auth{ID: "aa-codex-quota", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("register quota auth: %v", errRegister)
+	}
+	if _, errRegister := manager.Register(ctx, &Auth{ID: "bb-codex-ready", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("register ready auth: %v", errRegister)
+	}
+
+	retryAfter := 30 * time.Minute
+	manager.MarkResult(ctx, Result{
+		AuthID:     "aa-codex-quota",
+		Provider:   "codex",
+		Model:      model,
+		Success:    false,
+		Error:      &Error{HTTPStatus: http.StatusTooManyRequests, Message: "usage limit reached"},
+		RetryAfter: &retryAfter,
+	})
+
+	if _, errRegister := manager.Register(ctx, &Auth{ID: "aa-codex-quota", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("re-register quota auth: %v", errRegister)
+	}
+
+	got, _, errPick := manager.pickNext(ctx, "codex", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickNext() error = %v", errPick)
+	}
+	if got == nil || got.ID != "bb-codex-ready" {
+		t.Fatalf("pickNext() auth = %v, want bb-codex-ready", got)
+	}
+
+	updated, ok := manager.GetByID("aa-codex-quota")
+	if !ok || updated == nil {
+		t.Fatalf("expected quota auth to remain registered")
+	}
+	state := updated.ModelStates[model]
+	if state == nil || !state.Unavailable || !state.Quota.Exceeded || state.NextRetryAfter.IsZero() {
+		t.Fatalf("quota cooldown state was not preserved: %#v", state)
+	}
+}
+
+func TestManager_ReconcileRegistryModelStatesPreservesActiveQuotaCooldown(t *testing.T) {
+	ctx := context.Background()
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.RegisterExecutor(schedulerProviderTestExecutor{provider: "codex"})
+
+	model := "gpt-5.5"
+	registerSchedulerModels(t, "codex", model, "aa-codex-quota", "bb-codex-ready")
+
+	if _, errRegister := manager.Register(ctx, &Auth{ID: "aa-codex-quota", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("register quota auth: %v", errRegister)
+	}
+	if _, errRegister := manager.Register(ctx, &Auth{ID: "bb-codex-ready", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("register ready auth: %v", errRegister)
+	}
+
+	retryAfter := 30 * time.Minute
+	manager.MarkResult(ctx, Result{
+		AuthID:     "aa-codex-quota",
+		Provider:   "codex",
+		Model:      model,
+		Success:    false,
+		Error:      &Error{HTTPStatus: http.StatusTooManyRequests, Message: "usage limit reached"},
+		RetryAfter: &retryAfter,
+	})
+
+	registry.GetGlobalRegistry().RegisterClient("aa-codex-quota", "codex", []*registry.ModelInfo{{ID: model}})
+	manager.ReconcileRegistryModelStates(ctx, "aa-codex-quota")
+	manager.RefreshSchedulerEntry("aa-codex-quota")
+
+	got, _, errPick := manager.pickNext(ctx, "codex", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickNext() error = %v", errPick)
+	}
+	if got == nil || got.ID != "bb-codex-ready" {
+		t.Fatalf("pickNext() auth = %v, want bb-codex-ready", got)
+	}
+
+	updated, ok := manager.GetByID("aa-codex-quota")
+	if !ok || updated == nil {
+		t.Fatalf("expected quota auth to remain registered")
+	}
+	state := updated.ModelStates[model]
+	if state == nil || !state.Unavailable || !state.Quota.Exceeded || state.NextRetryAfter.IsZero() {
+		t.Fatalf("quota cooldown state was not preserved after reconcile: %#v", state)
+	}
+}

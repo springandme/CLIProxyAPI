@@ -381,12 +381,9 @@ func (m *Manager) RefreshSchedulerAll() {
 }
 
 // ReconcileRegistryModelStates aligns per-model runtime state with the current
-// registry snapshot for one auth.
-//
-// Supported models are reset to a clean state because re-registration already
-// cleared the registry-side cooldown/suspension snapshot. ModelStates for
-// models that are no longer present in the registry are pruned entirely so
-// renamed/removed models cannot keep auth-level status stale.
+// registry snapshot for one auth. Active quota cooldowns are preserved across
+// model re-registration and re-applied to the registry because re-registration
+// clears the registry-side cooldown/suspension snapshot.
 func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID string) {
 	if m == nil || authID == "" {
 		return
@@ -406,6 +403,7 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 	}
 
 	var snapshot *Auth
+	quotaModels := make([]string, 0)
 	now := time.Now()
 
 	m.mu.Lock()
@@ -429,6 +427,10 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 				continue
 			}
 			if modelStateIsClean(state) {
+				continue
+			}
+			if modelQuotaCooldownActive(state, now) {
+				quotaModels = append(quotaModels, baseModel)
 				continue
 			}
 			resetModelState(state, now)
@@ -456,6 +458,24 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 	if m.scheduler != nil && snapshot != nil {
 		m.scheduler.upsertAuth(snapshot)
 	}
+	if len(quotaModels) > 0 {
+		registryRef := registry.GetGlobalRegistry()
+		for _, modelKey := range quotaModels {
+			registryRef.SetModelQuotaExceeded(authID, modelKey)
+			registryRef.SuspendClientModel(authID, modelKey, "quota")
+		}
+	}
+}
+
+func modelQuotaCooldownActive(state *ModelState, now time.Time) bool {
+	if state == nil || !state.Quota.Exceeded {
+		return false
+	}
+	next := state.Quota.NextRecoverAt
+	if next.IsZero() {
+		next = state.NextRetryAfter
+	}
+	return !next.IsZero() && next.After(now)
 }
 
 func (m *Manager) SetSelector(selector Selector) {
@@ -1934,8 +1954,11 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		clearedCooldown = clearCooldownStateForAuth(auth, now)
 	}
 	auth.EnsureIndex()
-	authClone := auth.Clone()
 	m.mu.Lock()
+	if existing, ok := m.auths[auth.ID]; ok && existing != nil {
+		mergeRuntimeAuthState(auth, existing, time.Now())
+	}
+	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
@@ -1964,18 +1987,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.mu.Unlock()
 		return nil, nil
 	}
-	if !auth.indexAssigned && auth.Index == "" {
-		auth.Index = existing.Index
-		auth.indexAssigned = existing.indexAssigned
-	}
-	auth.Success = existing.Success
-	auth.Failed = existing.Failed
-	auth.recentRequests = existing.recentRequests
-	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
-		if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
-			auth.ModelStates = existing.ModelStates
-		}
-	}
+	mergeRuntimeAuthState(auth, existing, time.Now())
 	now := time.Now()
 	clearedCooldown := false
 	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
@@ -1998,6 +2010,44 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.persistCooldownStates(ctx)
 	}
 	return auth.Clone(), nil
+}
+
+func mergeRuntimeAuthState(auth *Auth, existing *Auth, now time.Time) {
+	if auth == nil || existing == nil {
+		return
+	}
+	if !auth.indexAssigned && auth.Index == "" {
+		auth.Index = existing.Index
+		auth.indexAssigned = existing.indexAssigned
+	}
+	auth.Success = existing.Success
+	auth.Failed = existing.Failed
+	auth.recentRequests = existing.recentRequests
+	if existing.Disabled || existing.Status == StatusDisabled || auth.Disabled || auth.Status == StatusDisabled {
+		return
+	}
+	auth.LastRefreshedAt = existing.LastRefreshedAt
+	auth.NextRefreshAfter = existing.NextRefreshAfter
+	mergeRuntimeModelStates(auth, existing, now)
+}
+
+func mergeRuntimeModelStates(auth *Auth, existing *Auth, now time.Time) {
+	if auth == nil || existing == nil || len(existing.ModelStates) == 0 {
+		return
+	}
+	if len(auth.ModelStates) == 0 {
+		auth.ModelStates = existing.ModelStates
+		return
+	}
+	for modelKey, state := range existing.ModelStates {
+		if !modelQuotaCooldownActive(state, now) {
+			continue
+		}
+		if incoming := auth.ModelStates[modelKey]; incoming != nil && !modelStateIsClean(incoming) {
+			continue
+		}
+		auth.ModelStates[modelKey] = state.Clone()
+	}
 }
 
 // Remove deletes an auth from runtime state without persisting.
@@ -3445,6 +3495,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								NextRecoverAt: next,
 								BackoffLevel:  backoffLevel,
 							}
+							logEntryWithRequestID(ctx).WithFields(log.Fields{
+								"auth_id":       auth.ID,
+								"model":         result.Model,
+								"next_retry_at": next,
+							}).Debug("auth model quota cooldown set")
 							if !disableCooling {
 								suspendReason = "quota"
 								shouldSuspendModel = true
