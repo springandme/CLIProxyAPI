@@ -298,17 +298,18 @@ type CodexInspectionScheduleConfig struct {
 
 // CodexInspectionConfig controls Codex account inspection behavior.
 type CodexInspectionConfig struct {
-	Enabled              *bool                         `yaml:"enabled,omitempty" json:"enabled,omitempty"`
-	Schedule             CodexInspectionScheduleConfig `yaml:"schedule" json:"schedule"`
-	TargetType           string                        `yaml:"target-type,omitempty" json:"targetType,omitempty"`
-	Workers              int                           `yaml:"workers,omitempty" json:"workers,omitempty"`
-	DeleteWorkers        int                           `yaml:"delete-workers,omitempty" json:"deleteWorkers,omitempty"`
-	Timeout              int                           `yaml:"timeout,omitempty" json:"timeout,omitempty"`
-	Retries              int                           `yaml:"retries,omitempty" json:"retries,omitempty"`
-	UserAgent            string                        `yaml:"user-agent,omitempty" json:"userAgent,omitempty"`
-	UsedPercentThreshold float64                       `yaml:"used-percent-threshold,omitempty" json:"usedPercentThreshold,omitempty"`
-	SampleSize           int                           `yaml:"sample-size,omitempty" json:"sampleSize,omitempty"`
-	AutoActionMode       string                        `yaml:"auto-action-mode,omitempty" json:"autoActionMode,omitempty"`
+	Enabled                *bool                         `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Schedule               CodexInspectionScheduleConfig `yaml:"schedule" json:"schedule"`
+	TargetType             string                        `yaml:"target-type,omitempty" json:"targetType,omitempty"`
+	Workers                int                           `yaml:"workers,omitempty" json:"workers,omitempty"`
+	DeleteWorkers          int                           `yaml:"delete-workers,omitempty" json:"deleteWorkers,omitempty"`
+	Timeout                int                           `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+	Retries                int                           `yaml:"retries,omitempty" json:"retries,omitempty"`
+	UserAgent              string                        `yaml:"user-agent,omitempty" json:"userAgent,omitempty"`
+	UsedPercentThreshold   float64                       `yaml:"used-percent-threshold,omitempty" json:"usedPercentThreshold,omitempty"`
+	SampleSize             int                           `yaml:"sample-size,omitempty" json:"sampleSize,omitempty"`
+	AutoActionMode         string                        `yaml:"auto-action-mode,omitempty" json:"autoActionMode,omitempty"`
+	ShortWindowAutoDisable bool                          `yaml:"short-window-auto-disable,omitempty" json:"shortWindowAutoDisable,omitempty"`
 }
 
 type codexInspectionConfig = CodexInspectionConfig
@@ -331,15 +332,16 @@ func DefaultCodexInspectionConfig() CodexInspectionConfig {
 			Mode:            CodexInspectionScheduleModeInterval,
 			IntervalMinutes: 60,
 		},
-		TargetType:           "codex",
-		Workers:              4,
-		DeleteWorkers:        4,
-		Timeout:              15000,
-		Retries:              0,
-		UserAgent:            "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
-		UsedPercentThreshold: 100,
-		SampleSize:           0,
-		AutoActionMode:       CodexInspectionAutoActionNone,
+		TargetType:             "codex",
+		Workers:                4,
+		DeleteWorkers:          4,
+		Timeout:                15000,
+		Retries:                0,
+		UserAgent:              "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
+		UsedPercentThreshold:   100,
+		SampleSize:             0,
+		AutoActionMode:         CodexInspectionAutoActionNone,
+		ShortWindowAutoDisable: false,
 	}
 }
 
@@ -367,6 +369,7 @@ func NormalizeCodexInspectionConfig(input CodexInspectionConfig, fallback CodexI
 		next.SampleSize = input.SampleSize
 	}
 	next.AutoActionMode = NormalizeCodexInspectionAutoActionMode(input.AutoActionMode, base.AutoActionMode)
+	next.ShortWindowAutoDisable = input.ShortWindowAutoDisable
 	return next
 }
 

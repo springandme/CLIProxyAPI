@@ -22,6 +22,9 @@ type Repository interface {
 	GetLatestCodexInspectionRunByTrigger(ctx context.Context, triggerType, triggerKey string) (CodexInspectionRun, bool, error)
 	ListCodexInspectionResults(ctx context.Context, runID int64) ([]CodexInspectionResult, error)
 	ListCodexInspectionLogs(ctx context.Context, runID int64) ([]CodexInspectionLog, error)
+	UpsertCodexInspectionCooldown(ctx context.Context, cooldown CodexInspectionCooldown) (CodexInspectionCooldown, error)
+	ListCodexInspectionCooldowns(ctx context.Context, includeResolved bool, limit int) ([]CodexInspectionCooldown, error)
+	UpdateCodexInspectionCooldown(ctx context.Context, cooldown CodexInspectionCooldown) error
 }
 
 type FileRepository struct {
@@ -32,12 +35,14 @@ type FileRepository struct {
 }
 
 type repositoryState struct {
-	NextRunID    int64                   `json:"nextRunId"`
-	NextResultID int64                   `json:"nextResultId"`
-	NextLogID    int64                   `json:"nextLogId"`
-	Runs         []CodexInspectionRun    `json:"runs"`
-	Results      []CodexInspectionResult `json:"results"`
-	Logs         []CodexInspectionLog    `json:"logs"`
+	NextRunID      int64                     `json:"nextRunId"`
+	NextResultID   int64                     `json:"nextResultId"`
+	NextLogID      int64                     `json:"nextLogId"`
+	NextCooldownID int64                     `json:"nextCooldownId"`
+	Runs           []CodexInspectionRun      `json:"runs"`
+	Results        []CodexInspectionResult   `json:"results"`
+	Logs           []CodexInspectionLog      `json:"logs"`
+	Cooldowns      []CodexInspectionCooldown `json:"cooldowns,omitempty"`
 }
 
 func NewFileRepository(dir string) *FileRepository {
@@ -269,6 +274,107 @@ func (r *FileRepository) ListCodexInspectionLogs(ctx context.Context, runID int6
 	return logs, nil
 }
 
+func (r *FileRepository) UpsertCodexInspectionCooldown(ctx context.Context, cooldown CodexInspectionCooldown) (CodexInspectionCooldown, error) {
+	_ = ctx
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.loadLocked(); err != nil {
+		return CodexInspectionCooldown{}, err
+	}
+	now := time.Now().UnixMilli()
+	if cooldown.CreatedAtMS <= 0 {
+		cooldown.CreatedAtMS = now
+	}
+	cooldown.UpdatedAtMS = now
+	if cooldown.Status == "" {
+		cooldown.Status = CodexInspectionCooldownPending
+	}
+	if cooldown.Source == "" {
+		cooldown.Source = "runtime_request"
+	}
+	for i := range r.state.Cooldowns {
+		existing := r.state.Cooldowns[i]
+		if existing.Status != CodexInspectionCooldownPending {
+			continue
+		}
+		if cooldownIdentityMatches(existing, cooldown) {
+			cooldown.ID = existing.ID
+			cooldown.CreatedAtMS = existing.CreatedAtMS
+			r.state.Cooldowns[i] = cooldown
+			return cooldown, r.saveLocked()
+		}
+	}
+	cooldown.ID = r.state.NextCooldownID
+	r.state.NextCooldownID++
+	r.state.Cooldowns = append(r.state.Cooldowns, cooldown)
+	return cooldown, r.saveLocked()
+}
+
+func (r *FileRepository) ListCodexInspectionCooldowns(ctx context.Context, includeResolved bool, limit int) ([]CodexInspectionCooldown, error) {
+	_ = ctx
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.loadLocked(); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 200
+	}
+	items := make([]CodexInspectionCooldown, 0, len(r.state.Cooldowns))
+	for _, item := range r.state.Cooldowns {
+		if !includeResolved && item.Status != CodexInspectionCooldownPending {
+			continue
+		}
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].RestoreAtMS == items[j].RestoreAtMS {
+			return items[i].ID > items[j].ID
+		}
+		return items[i].RestoreAtMS > items[j].RestoreAtMS
+	})
+	if len(items) > limit {
+		items = items[:limit]
+	}
+	return items, nil
+}
+
+func (r *FileRepository) UpdateCodexInspectionCooldown(ctx context.Context, cooldown CodexInspectionCooldown) error {
+	_ = ctx
+	if cooldown.ID <= 0 {
+		return errors.New("codex inspection cooldown id is required")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.loadLocked(); err != nil {
+		return err
+	}
+	cooldown.UpdatedAtMS = time.Now().UnixMilli()
+	for i := range r.state.Cooldowns {
+		if r.state.Cooldowns[i].ID == cooldown.ID {
+			r.state.Cooldowns[i] = cooldown
+			return r.saveLocked()
+		}
+	}
+	return errors.New("codex inspection cooldown not found")
+}
+
+func cooldownIdentityMatches(a, b CodexInspectionCooldown) bool {
+	if strings.TrimSpace(a.AuthID) != "" && strings.TrimSpace(b.AuthID) != "" {
+		return strings.TrimSpace(a.AuthID) == strings.TrimSpace(b.AuthID)
+	}
+	if strings.TrimSpace(a.FileName) == "" || strings.TrimSpace(b.FileName) == "" || strings.TrimSpace(a.FileName) != strings.TrimSpace(b.FileName) {
+		return false
+	}
+	if strings.TrimSpace(a.AuthIndex) != "" && strings.TrimSpace(b.AuthIndex) != "" {
+		return strings.TrimSpace(a.AuthIndex) == strings.TrimSpace(b.AuthIndex)
+	}
+	if strings.TrimSpace(a.AccountID) != "" && strings.TrimSpace(b.AccountID) != "" {
+		return strings.TrimSpace(a.AccountID) == strings.TrimSpace(b.AccountID)
+	}
+	return true
+}
+
 func (r *FileRepository) loadLocked() error {
 	if r.loaded {
 		return nil
@@ -282,6 +388,9 @@ func (r *FileRepository) loadLocked() error {
 	}
 	if r.state.NextLogID == 0 {
 		r.state.NextLogID = 1
+	}
+	if r.state.NextCooldownID == 0 {
+		r.state.NextCooldownID = 1
 	}
 	if strings.TrimSpace(r.path) == "" {
 		return errors.New("codex inspection repository path is empty")
@@ -306,6 +415,9 @@ func (r *FileRepository) loadLocked() error {
 	}
 	if r.state.NextLogID == 0 {
 		r.state.NextLogID = 1
+	}
+	if r.state.NextCooldownID == 0 {
+		r.state.NextCooldownID = 1
 	}
 	return nil
 }

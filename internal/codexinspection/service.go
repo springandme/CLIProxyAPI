@@ -19,6 +19,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -49,6 +50,36 @@ type Service struct {
 
 	mu      sync.Mutex
 	running bool
+}
+
+func (s *Service) OnAuthRegistered(ctx context.Context, auth *coreauth.Auth) {
+	_ = ctx
+	_ = auth
+}
+
+func (s *Service) OnAuthUpdated(ctx context.Context, auth *coreauth.Auth) {
+	_ = ctx
+	_ = auth
+}
+
+func (s *Service) OnResult(ctx context.Context, result coreauth.Result) {
+	if s == nil || result.Success || result.Error == nil {
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(result.Provider), "codex") {
+		return
+	}
+	cfg, configured, err := s.ResolveConfig(ctx)
+	if err != nil || !configured || !cfg.ShortWindowAutoDisable {
+		return
+	}
+	restoreAt, ok := runtimeShortWindowRestoreAt(result)
+	if !ok {
+		return
+	}
+	if err := s.createRuntimeShortWindowCooldown(ctx, result, restoreAt); err != nil {
+		logRuntimeCooldownError(err)
+	}
 }
 
 func (s *Service) currentAuthManager() *coreauth.Manager {
@@ -311,6 +342,13 @@ func (s *Service) Run(ctx context.Context, req RunRequest) (RunDetail, error) {
 
 func (s *Service) ListRuns(ctx context.Context, limit int) ([]CodexInspectionRun, error) {
 	return s.store.ListCodexInspectionRuns(ctx, limit)
+}
+
+func (s *Service) ListCooldowns(ctx context.Context, includeResolved bool, limit int) ([]CodexInspectionCooldown, error) {
+	if s == nil || s.store == nil {
+		return nil, ErrNotConfigured
+	}
+	return s.store.ListCodexInspectionCooldowns(ctx, includeResolved, limit)
 }
 
 func (s *Service) GetRun(ctx context.Context, id int64) (RunDetail, error) {
@@ -1055,6 +1093,223 @@ func (s *Service) setAuthDisabled(ctx context.Context, name string, disabled boo
 	auth.UpdatedAt = time.Now()
 	_, err := manager.Update(ctx, auth)
 	return err
+}
+
+func (s *Service) createRuntimeShortWindowCooldown(ctx context.Context, result coreauth.Result, restoreAt time.Time) error {
+	if s == nil || s.store == nil {
+		return ErrNotConfigured
+	}
+	manager := s.currentAuthManager()
+	if manager == nil {
+		return ErrNotConfigured
+	}
+	auth, ok := manager.GetByID(strings.TrimSpace(result.AuthID))
+	if !ok || auth == nil {
+		return fmt.Errorf("auth not found")
+	}
+	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
+		return nil
+	}
+	auth.EnsureIndex()
+	fileName := strings.TrimSpace(auth.FileName)
+	if fileName == "" {
+		fileName = strings.TrimSpace(auth.ID)
+	}
+	if fileName == "" {
+		return fmt.Errorf("auth file name is empty")
+	}
+	now := time.Now()
+	if !restoreAt.After(now) {
+		return nil
+	}
+
+	auth.Disabled = true
+	auth.Status = coreauth.StatusDisabled
+	auth.StatusMessage = "disabled via codex short-window cooldown"
+	auth.UpdatedAt = now
+	if _, err := manager.Update(ctx, auth); err != nil {
+		return fmt.Errorf("disable auth for codex short-window cooldown: %w", err)
+	}
+
+	account := toAccount(s.authFileFromAuth(auth))
+	cooldown := CodexInspectionCooldown{
+		Status:         CodexInspectionCooldownPending,
+		Source:         "runtime_request",
+		AuthID:         strings.TrimSpace(auth.ID),
+		AuthIndex:      strings.TrimSpace(auth.Index),
+		AccountID:      strings.TrimSpace(account.AccountID),
+		FileName:       fileName,
+		DisplayAccount: firstNonEmpty(account.DisplayAccount, auth.Label, fileName),
+		Provider:       strings.ToLower(strings.TrimSpace(auth.Provider)),
+		WindowID:       "five-hour",
+		Reason:         runtimeShortWindowCooldownReason(result),
+		TriggeredAtMS:  now.UnixMilli(),
+		RestoreAtMS:    restoreAt.UnixMilli(),
+	}
+	if _, err := s.store.UpsertCodexInspectionCooldown(ctx, cooldown); err != nil {
+		return fmt.Errorf("persist codex short-window cooldown: %w", err)
+	}
+	log.WithFields(log.Fields{
+		"auth_id":       auth.ID,
+		"file_name":     fileName,
+		"restore_at_ms": restoreAt.UnixMilli(),
+	}).Info("codex auth disabled until short-window quota reset")
+	return nil
+}
+
+func (s *Service) ProcessDueCooldowns(ctx context.Context, now time.Time) error {
+	if s == nil || s.store == nil {
+		return ErrNotConfigured
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	items, err := s.store.ListCodexInspectionCooldowns(ctx, false, 500)
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		if item.Status != CodexInspectionCooldownPending || item.RestoreAtMS <= 0 || item.RestoreAtMS > now.UnixMilli() {
+			continue
+		}
+		if err := s.processDueCooldown(ctx, item, now); err != nil {
+			log.WithError(err).WithFields(log.Fields{
+				"cooldown_id": item.ID,
+				"auth_id":     item.AuthID,
+				"file_name":   item.FileName,
+			}).Warn("restore codex short-window cooldown")
+		}
+	}
+	return nil
+}
+
+func (s *Service) processDueCooldown(ctx context.Context, item CodexInspectionCooldown, now time.Time) error {
+	auth, ok := s.authForCooldown(item)
+	if !ok || auth == nil {
+		item.Status = CodexInspectionCooldownCanceled
+		item.Error = "auth not found"
+		return s.store.UpdateCodexInspectionCooldown(ctx, item)
+	}
+	account := toAccount(s.authFileFromAuth(auth))
+	if !cooldownMatchesAuth(item, auth, account) {
+		item.Status = CodexInspectionCooldownCanceled
+		item.Error = "auth identity changed"
+		return s.store.UpdateCodexInspectionCooldown(ctx, item)
+	}
+	if !auth.Disabled && auth.Status != coreauth.StatusDisabled {
+		item.Status = CodexInspectionCooldownCanceled
+		item.Error = "auth already enabled"
+		return s.store.UpdateCodexInspectionCooldown(ctx, item)
+	}
+	auth.Disabled = false
+	auth.Status = coreauth.StatusActive
+	auth.StatusMessage = ""
+	auth.UpdatedAt = now
+	manager := s.currentAuthManager()
+	if manager == nil {
+		item.Status = CodexInspectionCooldownFailed
+		item.Error = ErrNotConfigured.Error()
+		_ = s.store.UpdateCodexInspectionCooldown(ctx, item)
+		return ErrNotConfigured
+	}
+	if _, err := manager.Update(ctx, auth); err != nil {
+		item.Status = CodexInspectionCooldownFailed
+		item.Error = err.Error()
+		_ = s.store.UpdateCodexInspectionCooldown(ctx, item)
+		return err
+	}
+	item.Status = CodexInspectionCooldownRestored
+	item.RestoredAtMS = now.UnixMilli()
+	item.Error = ""
+	if err := s.store.UpdateCodexInspectionCooldown(ctx, item); err != nil {
+		return err
+	}
+	log.WithFields(log.Fields{
+		"cooldown_id": item.ID,
+		"auth_id":     auth.ID,
+		"file_name":   item.FileName,
+	}).Info("codex auth restored after short-window quota reset")
+	return nil
+}
+
+func (s *Service) authForCooldown(item CodexInspectionCooldown) (*coreauth.Auth, bool) {
+	manager := s.currentAuthManager()
+	if manager == nil {
+		return nil, false
+	}
+	if id := strings.TrimSpace(item.AuthID); id != "" {
+		if auth, ok := manager.GetByID(id); ok {
+			return auth, true
+		}
+	}
+	if auth, ok := s.authByName(item.FileName); ok {
+		return auth, true
+	}
+	if item.AuthIndex != "" {
+		return s.authByIndex(item.AuthIndex)
+	}
+	return nil, false
+}
+
+func cooldownMatchesAuth(item CodexInspectionCooldown, auth *coreauth.Auth, account account) bool {
+	if auth == nil {
+		return false
+	}
+	if item.AuthID != "" && strings.TrimSpace(auth.ID) != strings.TrimSpace(item.AuthID) {
+		return false
+	}
+	if item.AuthIndex != "" && strings.TrimSpace(auth.EnsureIndex()) != strings.TrimSpace(item.AuthIndex) {
+		return false
+	}
+	if item.AccountID != "" && strings.TrimSpace(account.AccountID) != strings.TrimSpace(item.AccountID) {
+		return false
+	}
+	return true
+}
+
+func runtimeShortWindowRestoreAt(result coreauth.Result) (time.Time, bool) {
+	if result.RetryAfter == nil || *result.RetryAfter <= 0 || *result.RetryAfter > 6*time.Hour {
+		return time.Time{}, false
+	}
+	if result.Error == nil || !runtimeShortWindowQuotaError(result.Error) {
+		return time.Time{}, false
+	}
+	return time.Now().Add(*result.RetryAfter), true
+}
+
+func runtimeShortWindowQuotaError(err *coreauth.Error) bool {
+	if err == nil {
+		return false
+	}
+	if err.HTTPStatus == http.StatusTooManyRequests {
+		return true
+	}
+	text := strings.ToLower(strings.Join([]string{err.Code, err.Message}, " "))
+	return strings.Contains(text, "usage_limit_reached") ||
+		strings.Contains(text, "quota") ||
+		strings.Contains(text, "limit reached") ||
+		strings.Contains(text, "usage limit")
+}
+
+func runtimeShortWindowCooldownReason(result coreauth.Result) string {
+	if result.Error == nil {
+		return "codex 5h quota reached"
+	}
+	reason := strings.TrimSpace(result.Error.Code)
+	if reason == "" {
+		reason = strings.TrimSpace(result.Error.Message)
+	}
+	if reason == "" {
+		reason = "codex 5h quota reached"
+	}
+	return reason
+}
+
+func logRuntimeCooldownError(err error) {
+	if err == nil {
+		return
+	}
+	log.WithError(err).Warn("process codex short-window auto-disable")
 }
 
 func (s *Service) deleteAuthFile(ctx context.Context, name string) error {
@@ -2090,7 +2345,21 @@ func addCodexWindowInfo(
 		UsedPercent:        usedPercent,
 		ResetLabel:         resetLabel,
 		LimitWindowSeconds: window.LimitWindowSeconds,
+		ResetAtMS:          codexWindowResetAtMS(window),
 	})
+}
+
+func codexWindowResetAtMS(window *codexWindow) int64 {
+	if window == nil {
+		return 0
+	}
+	if window.ResetAt != nil && *window.ResetAt > 0 {
+		return int64(math.Floor(*window.ResetAt)) * int64(time.Second/time.Millisecond)
+	}
+	if window.ResetAfterSeconds != nil && *window.ResetAfterSeconds > 0 {
+		return time.Now().Add(time.Duration(math.Floor(*window.ResetAfterSeconds)) * time.Second).UnixMilli()
+	}
+	return 0
 }
 
 func addAdditionalRateLimitWindows(windows *[]CodexInspectionQuotaWindow, additionalRateLimits []map[string]any, teamPlan bool) {

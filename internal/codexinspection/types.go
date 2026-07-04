@@ -31,20 +31,26 @@ const (
 	CodexInspectionActionStatusFailed      = "failed"
 	CodexInspectionActionStatusSkipped     = "skipped"
 	CodexInspectionActionStatusNeedsReview = "needs_review"
+
+	CodexInspectionCooldownPending  = "pending"
+	CodexInspectionCooldownRestored = "restored"
+	CodexInspectionCooldownFailed   = "failed"
+	CodexInspectionCooldownCanceled = "canceled"
 )
 
 type ManagerCodexInspectionConfig struct {
-	Enabled              *bool                                `yaml:"enabled,omitempty" json:"enabled,omitempty"`
-	Schedule             ManagerCodexInspectionScheduleConfig `yaml:"schedule" json:"schedule"`
-	TargetType           string                               `yaml:"target-type,omitempty" json:"targetType,omitempty"`
-	Workers              int                                  `yaml:"workers,omitempty" json:"workers,omitempty"`
-	DeleteWorkers        int                                  `yaml:"delete-workers,omitempty" json:"deleteWorkers,omitempty"`
-	Timeout              int                                  `yaml:"timeout,omitempty" json:"timeout,omitempty"`
-	Retries              int                                  `yaml:"retries,omitempty" json:"retries,omitempty"`
-	UserAgent            string                               `yaml:"user-agent,omitempty" json:"userAgent,omitempty"`
-	UsedPercentThreshold float64                              `yaml:"used-percent-threshold,omitempty" json:"usedPercentThreshold,omitempty"`
-	SampleSize           int                                  `yaml:"sample-size,omitempty" json:"sampleSize,omitempty"`
-	AutoActionMode       string                               `yaml:"auto-action-mode,omitempty" json:"autoActionMode,omitempty"`
+	Enabled                *bool                                `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Schedule               ManagerCodexInspectionScheduleConfig `yaml:"schedule" json:"schedule"`
+	TargetType             string                               `yaml:"target-type,omitempty" json:"targetType,omitempty"`
+	Workers                int                                  `yaml:"workers,omitempty" json:"workers,omitempty"`
+	DeleteWorkers          int                                  `yaml:"delete-workers,omitempty" json:"deleteWorkers,omitempty"`
+	Timeout                int                                  `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+	Retries                int                                  `yaml:"retries,omitempty" json:"retries,omitempty"`
+	UserAgent              string                               `yaml:"user-agent,omitempty" json:"userAgent,omitempty"`
+	UsedPercentThreshold   float64                              `yaml:"used-percent-threshold,omitempty" json:"usedPercentThreshold,omitempty"`
+	SampleSize             int                                  `yaml:"sample-size,omitempty" json:"sampleSize,omitempty"`
+	AutoActionMode         string                               `yaml:"auto-action-mode,omitempty" json:"autoActionMode,omitempty"`
+	ShortWindowAutoDisable bool                                 `yaml:"short-window-auto-disable,omitempty" json:"shortWindowAutoDisable,omitempty"`
 }
 
 type ManagerCodexInspectionScheduleConfig struct {
@@ -85,6 +91,7 @@ type CodexInspectionQuotaWindow struct {
 	UsedPercent        *float64       `json:"usedPercent,omitempty"`
 	ResetLabel         string         `json:"resetLabel"`
 	LimitWindowSeconds *float64       `json:"limitWindowSeconds,omitempty"`
+	ResetAtMS          int64          `json:"resetAtMs,omitempty"`
 }
 
 type CodexInspectionResult struct {
@@ -113,7 +120,32 @@ type CodexInspectionResult struct {
 	QuotaWindowsJSON string                       `json:"-"`
 	ErrorKind        string                       `json:"errorKind,omitempty"`
 	ErrorDetail      string                       `json:"errorDetail,omitempty"`
+	CooldownUntilMS  int64                        `json:"cooldownUntilMs,omitempty"`
+	CooldownWindowID string                       `json:"cooldownWindowId,omitempty"`
+	CooldownReason   string                       `json:"cooldownReason,omitempty"`
 	CreatedAtMS      int64                        `json:"createdAtMs"`
+}
+
+type CodexInspectionCooldown struct {
+	ID              int64  `json:"id"`
+	Status          string `json:"status"`
+	Source          string `json:"source"`
+	AuthID          string `json:"authId,omitempty"`
+	AuthIndex       string `json:"authIndex,omitempty"`
+	AccountID       string `json:"accountId,omitempty"`
+	FileName        string `json:"fileName"`
+	DisplayAccount  string `json:"displayAccount"`
+	Provider        string `json:"provider"`
+	WindowID        string `json:"windowId"`
+	Reason          string `json:"reason"`
+	TriggerRunID    int64  `json:"triggerRunId,omitempty"`
+	TriggerResultID int64  `json:"triggerResultId,omitempty"`
+	TriggeredAtMS   int64  `json:"triggeredAtMs"`
+	RestoreAtMS     int64  `json:"restoreAtMs"`
+	RestoredAtMS    int64  `json:"restoredAtMs,omitempty"`
+	Error           string `json:"error,omitempty"`
+	CreatedAtMS     int64  `json:"createdAtMs"`
+	UpdatedAtMS     int64  `json:"updatedAtMs"`
 }
 
 type CodexInspectionLog struct {
@@ -133,15 +165,16 @@ func DefaultCodexInspectionConfig() ManagerCodexInspectionConfig {
 			Mode:            CodexInspectionScheduleModeInterval,
 			IntervalMinutes: 60,
 		},
-		TargetType:           "codex",
-		Workers:              4,
-		DeleteWorkers:        4,
-		Timeout:              15000,
-		Retries:              0,
-		UserAgent:            "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
-		UsedPercentThreshold: 100,
-		SampleSize:           0,
-		AutoActionMode:       CodexInspectionAutoActionNone,
+		TargetType:             "codex",
+		Workers:                4,
+		DeleteWorkers:          4,
+		Timeout:                15000,
+		Retries:                0,
+		UserAgent:              "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
+		UsedPercentThreshold:   100,
+		SampleSize:             0,
+		AutoActionMode:         CodexInspectionAutoActionNone,
+		ShortWindowAutoDisable: false,
 	}
 }
 
@@ -172,6 +205,7 @@ func NormalizeCodexInspectionConfig(input ManagerCodexInspectionConfig, fallback
 		next.SampleSize = input.SampleSize
 	}
 	next.AutoActionMode = NormalizeCodexInspectionAutoActionMode(input.AutoActionMode, base.AutoActionMode)
+	next.ShortWindowAutoDisable = input.ShortWindowAutoDisable
 	return next
 }
 

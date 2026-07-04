@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/codexinspection"
@@ -59,6 +60,22 @@ func (h *Handler) ListCodexInspectionRuns(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"items": runs})
+}
+
+func (h *Handler) ListCodexInspectionCooldowns(c *gin.Context) {
+	service := h.getCodexInspectionService()
+	if service == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "codex inspection service unavailable"})
+		return
+	}
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	includeResolved := strings.EqualFold(c.Query("includeResolved"), "true") || c.Query("includeResolved") == "1"
+	items, err := service.ListCooldowns(c.Request.Context(), includeResolved, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items})
 }
 
 func (h *Handler) RunCodexInspection(c *gin.Context) {

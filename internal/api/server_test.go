@@ -381,11 +381,8 @@ func TestManagementControlPanelDoesNotUseCodexInspectionStandalonePage(t *testin
 	codexReq := httptest.NewRequest(http.MethodGet, "/codex-inspection.html", nil)
 	codexRR := httptest.NewRecorder()
 	server.engine.ServeHTTP(codexRR, codexReq)
-	if codexRR.Code != http.StatusOK {
-		t.Fatalf("codex inspection status = %d, want %d body=%s", codexRR.Code, http.StatusOK, codexRR.Body.String())
-	}
-	if !strings.Contains(codexRR.Body.String(), "Codex 账号巡检") {
-		t.Fatalf("codex inspection body missing title: %s", codexRR.Body.String())
+	if codexRR.Code != http.StatusNotFound {
+		t.Fatalf("codex inspection status = %d, want %d body=%s", codexRR.Code, http.StatusNotFound, codexRR.Body.String())
 	}
 }
 

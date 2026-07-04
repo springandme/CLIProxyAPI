@@ -39,6 +39,10 @@ func (w *Worker) run(ctx context.Context) {
 }
 
 func (w *Worker) tick(ctx context.Context) {
+	now := time.Now()
+	if err := w.service.ProcessDueCooldowns(ctx, now); err != nil && err != ErrNotConfigured {
+		log.WithError(err).Warn("process codex inspection cooldowns")
+	}
 	cfg, configured, err := w.service.ResolveConfig(ctx)
 	if err != nil {
 		log.WithError(err).Warn("resolve codex inspection config")
@@ -47,7 +51,6 @@ func (w *Worker) tick(ctx context.Context) {
 	if !configured || cfg.Enabled == nil || !*cfg.Enabled {
 		return
 	}
-	now := time.Now()
 	triggerKey := CodexInspectionTriggerKey(now, cfg)
 	if triggerKey == "" || !CodexInspectionScheduleDue(now, w.lastScheduledRunTime(ctx), cfg) {
 		return

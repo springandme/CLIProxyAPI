@@ -214,6 +214,53 @@ func (NoopHook) OnAuthUpdated(context.Context, *Auth) {}
 // OnResult implements Hook.
 func (NoopHook) OnResult(context.Context, Result) {}
 
+type hookChain []Hook
+
+func (h hookChain) OnAuthRegistered(ctx context.Context, auth *Auth) {
+	for _, item := range h {
+		if item != nil {
+			item.OnAuthRegistered(ctx, auth)
+		}
+	}
+}
+
+func (h hookChain) OnAuthUpdated(ctx context.Context, auth *Auth) {
+	for _, item := range h {
+		if item != nil {
+			item.OnAuthUpdated(ctx, auth)
+		}
+	}
+}
+
+func (h hookChain) OnResult(ctx context.Context, result Result) {
+	for _, item := range h {
+		if item != nil {
+			item.OnResult(ctx, result)
+		}
+	}
+}
+
+// ChainHooks combines hooks while ignoring nil and NoopHook entries.
+func ChainHooks(hooks ...Hook) Hook {
+	chain := make(hookChain, 0, len(hooks))
+	for _, hook := range hooks {
+		if hook == nil {
+			continue
+		}
+		if _, ok := hook.(NoopHook); ok {
+			continue
+		}
+		chain = append(chain, hook)
+	}
+	if len(chain) == 0 {
+		return NoopHook{}
+	}
+	if len(chain) == 1 {
+		return chain[0]
+	}
+	return chain
+}
+
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
 	store         Store
@@ -292,6 +339,29 @@ func (m *Manager) SetPluginScheduler(scheduler PluginScheduler) {
 	}
 	m.mu.Lock()
 	m.pluginScheduler = scheduler
+	m.mu.Unlock()
+}
+
+// SetHook replaces the lifecycle hook used by the manager.
+func (m *Manager) SetHook(hook Hook) {
+	if m == nil {
+		return
+	}
+	if hook == nil {
+		hook = NoopHook{}
+	}
+	m.mu.Lock()
+	m.hook = hook
+	m.mu.Unlock()
+}
+
+// AddHook appends a lifecycle hook to the current manager hook.
+func (m *Manager) AddHook(hook Hook) {
+	if m == nil || hook == nil {
+		return
+	}
+	m.mu.Lock()
+	m.hook = ChainHooks(m.hook, hook)
 	m.mu.Unlock()
 }
 

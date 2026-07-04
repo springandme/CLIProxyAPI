@@ -367,6 +367,9 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		},
 	)
 	s.mgmt.SetCodexInspectionService(s.codexInspectionService)
+	if authManager != nil {
+		authManager.AddHook(s.codexInspectionService)
+	}
 	codexinspection.NewWorker(s.codexInspectionRepo, s.codexInspectionService).Start(context.Background())
 	if optionState.localPassword != "" {
 		s.mgmt.SetLocalPassword(optionState.localPassword)
@@ -425,7 +428,7 @@ func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
 		}
 		if c != nil && c.Request != nil {
 			path := c.Request.URL.Path
-			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || strings.HasPrefix(path, "/v0/resource/plugins/") || path == "/management.html" || path == "/codex-inspection.html" {
+			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || strings.HasPrefix(path, "/v0/resource/plugins/") || path == "/management.html" {
 				c.Next()
 				return
 			}
@@ -454,7 +457,6 @@ func (s *Server) setupRoutes() {
 	s.engine.HEAD("/healthz", healthzHandler)
 
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
-	s.engine.GET("/codex-inspection.html", s.serveCodexInspectionPanel)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
 	claudeCodeHandlers := claude.NewClaudeCodeAPIHandler(s.handlers)
@@ -678,6 +680,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/codex-inspection/config", s.mgmt.PutCodexInspectionConfig)
 		mgmt.PATCH("/codex-inspection/config", s.mgmt.PutCodexInspectionConfig)
 		mgmt.GET("/codex-inspection/runs", s.mgmt.ListCodexInspectionRuns)
+		mgmt.GET("/codex-inspection/cooldowns", s.mgmt.ListCodexInspectionCooldowns)
 		mgmt.POST("/codex-inspection/run", s.mgmt.RunCodexInspection)
 		mgmt.GET("/codex-inspection/runs/:id", s.mgmt.GetCodexInspectionRun)
 		mgmt.POST("/codex-inspection/runs/:id/actions", s.mgmt.ExecuteCodexInspectionActions)
@@ -916,15 +919,16 @@ func codexInspectionConfigFromConfig(input config.CodexInspectionConfig) codexin
 			IntervalMinutes: input.Schedule.IntervalMinutes,
 			TimeZone:        input.Schedule.TimeZone,
 		},
-		TargetType:           input.TargetType,
-		Workers:              input.Workers,
-		DeleteWorkers:        input.DeleteWorkers,
-		Timeout:              input.Timeout,
-		Retries:              input.Retries,
-		UserAgent:            input.UserAgent,
-		UsedPercentThreshold: input.UsedPercentThreshold,
-		SampleSize:           input.SampleSize,
-		AutoActionMode:       input.AutoActionMode,
+		TargetType:             input.TargetType,
+		Workers:                input.Workers,
+		DeleteWorkers:          input.DeleteWorkers,
+		Timeout:                input.Timeout,
+		Retries:                input.Retries,
+		UserAgent:              input.UserAgent,
+		UsedPercentThreshold:   input.UsedPercentThreshold,
+		SampleSize:             input.SampleSize,
+		AutoActionMode:         input.AutoActionMode,
+		ShortWindowAutoDisable: input.ShortWindowAutoDisable,
 	}
 }
 
@@ -956,21 +960,6 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 	}
 
 	c.File(filePath)
-}
-
-func (s *Server) serveCodexInspectionPanel(c *gin.Context) {
-	cfg := s.cfg
-	if cfg == nil || cfg.Home.Enabled || cfg.RemoteManagement.DisableControlPanel {
-		c.AbortWithStatus(http.StatusNotFound)
-		return
-	}
-	builtin := managementasset.BuiltinCodexInspectionHTML()
-	if len(builtin) == 0 {
-		c.AbortWithStatus(http.StatusNotFound)
-		return
-	}
-	c.Header("Cache-Control", "no-store")
-	c.Data(http.StatusOK, "text/html; charset=utf-8", builtin)
 }
 
 func (s *Server) enableKeepAlive(timeout time.Duration, onTimeout func()) {
