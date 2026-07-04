@@ -357,6 +357,38 @@ func TestHomeEnabledHidesManagementEndpointsAndControlPanel(t *testing.T) {
 	})
 }
 
+func TestManagementControlPanelDoesNotUseCodexInspectionStandalonePage(t *testing.T) {
+	staticDir := t.TempDir()
+	staticHTML := []byte("<!doctype html><title>full management center</title>")
+	staticPath := filepath.Join(staticDir, "management.html")
+	if errWrite := os.WriteFile(staticPath, staticHTML, 0o600); errWrite != nil {
+		t.Fatalf("write management asset: %v", errWrite)
+	}
+	t.Setenv("MANAGEMENT_STATIC_PATH", staticDir)
+
+	server := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/management.html", nil)
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	if got := rr.Body.String(); got != string(staticHTML) {
+		t.Fatalf("management.html body = %q, want static management asset", got)
+	}
+
+	codexReq := httptest.NewRequest(http.MethodGet, "/codex-inspection.html", nil)
+	codexRR := httptest.NewRecorder()
+	server.engine.ServeHTTP(codexRR, codexReq)
+	if codexRR.Code != http.StatusOK {
+		t.Fatalf("codex inspection status = %d, want %d body=%s", codexRR.Code, http.StatusOK, codexRR.Body.String())
+	}
+	if !strings.Contains(codexRR.Body.String(), "Codex 账号巡检") {
+		t.Fatalf("codex inspection body missing title: %s", codexRR.Body.String())
+	}
+}
+
 func TestModelsDispatchByAnthropicVersionHeader(t *testing.T) {
 	modelRegistry := registry.GetGlobalRegistry()
 	clientID := "test-anthropic-version-dispatch"

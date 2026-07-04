@@ -2,10 +2,10 @@ package managementasset
 
 import _ "embed"
 
-//go:embed builtin/management.html
-var builtinManagementHTML []byte
+//go:embed builtin/codex-inspection.html
+var builtinCodexInspectionHTML []byte
 
-// BuiltinManagementHTML returns the management panel bundled with this binary.
-func BuiltinManagementHTML() []byte {
-	return builtinManagementHTML
+// BuiltinCodexInspectionHTML returns the bundled standalone Codex inspection panel.
+func BuiltinCodexInspectionHTML() []byte {
+	return builtinCodexInspectionHTML
 }
