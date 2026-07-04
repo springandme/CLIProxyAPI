@@ -27,6 +27,7 @@ import (
 	managementHandlers "github.com/router-for-me/CLIProxyAPI/v7/internal/api/handlers/management"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api/middleware"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/codexinspection"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
@@ -221,6 +222,9 @@ type Server struct {
 	// management handler
 	mgmt *managementHandlers.Handler
 
+	codexInspectionService *codexinspection.Service
+	codexInspectionRepo    codexinspection.Repository
+
 	// pluginHost owns dynamic plugin Management API route dispatch.
 	pluginHost *pluginhost.Host
 
@@ -336,6 +340,34 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
 	s.mgmt.SetPluginHost(optionState.pluginHost)
 	s.mgmt.SetConfigReloadHook(optionState.configReloadHook)
+	codexInspectionDir := resolveCodexInspectionDataDir(cfg, configFilePath)
+	s.codexInspectionRepo = codexinspection.NewFileRepository(codexInspectionDir)
+	s.codexInspectionService = codexinspection.New(
+		s.codexInspectionRepo,
+		func() codexinspection.ManagerCodexInspectionConfig {
+			if s == nil || s.cfg == nil {
+				return codexinspection.DefaultCodexInspectionConfig()
+			}
+			return codexInspectionConfigFromConfig(s.cfg.CodexInspection)
+		},
+		func() string {
+			if s == nil || s.cfg == nil {
+				return ""
+			}
+			if authDir, err := util.ResolveAuthDir(s.cfg.AuthDir); err == nil {
+				return authDir
+			}
+			return s.cfg.AuthDir
+		},
+		func() *auth.Manager {
+			if s.handlers == nil {
+				return nil
+			}
+			return s.handlers.AuthManager
+		},
+	)
+	s.mgmt.SetCodexInspectionService(s.codexInspectionService)
+	codexinspection.NewWorker(s.codexInspectionRepo, s.codexInspectionService).Start(context.Background())
 	if optionState.localPassword != "" {
 		s.mgmt.SetLocalPassword(optionState.localPassword)
 	}
@@ -641,6 +673,14 @@ func (s *Server) registerManagementRoutes() {
 
 		mgmt.POST("/api-call", s.mgmt.APICall)
 
+		mgmt.GET("/codex-inspection/config", s.mgmt.GetCodexInspectionConfig)
+		mgmt.PUT("/codex-inspection/config", s.mgmt.PutCodexInspectionConfig)
+		mgmt.PATCH("/codex-inspection/config", s.mgmt.PutCodexInspectionConfig)
+		mgmt.GET("/codex-inspection/runs", s.mgmt.ListCodexInspectionRuns)
+		mgmt.POST("/codex-inspection/run", s.mgmt.RunCodexInspection)
+		mgmt.GET("/codex-inspection/runs/:id", s.mgmt.GetCodexInspectionRun)
+		mgmt.POST("/codex-inspection/runs/:id/actions", s.mgmt.ExecuteCodexInspectionActions)
+
 		mgmt.GET("/quota-exceeded/switch-project", s.mgmt.GetSwitchProject)
 		mgmt.PUT("/quota-exceeded/switch-project", s.mgmt.PutSwitchProject)
 		mgmt.PATCH("/quota-exceeded/switch-project", s.mgmt.PutSwitchProject)
@@ -854,10 +894,48 @@ func (s *Server) pluginResourceNoRoute(c *gin.Context) {
 	c.AbortWithStatus(http.StatusNotFound)
 }
 
+func resolveCodexInspectionDataDir(cfg *config.Config, configFilePath string) string {
+	if cfg != nil {
+		if authDir, err := util.ResolveAuthDir(cfg.AuthDir); err == nil && strings.TrimSpace(authDir) != "" {
+			return filepath.Join(authDir, "codex-inspection")
+		}
+	}
+	if strings.TrimSpace(configFilePath) != "" {
+		return filepath.Join(filepath.Dir(configFilePath), "codex-inspection")
+	}
+	return filepath.Join(".", "codex-inspection")
+}
+
+func codexInspectionConfigFromConfig(input config.CodexInspectionConfig) codexinspection.ManagerCodexInspectionConfig {
+	return codexinspection.ManagerCodexInspectionConfig{
+		Enabled: input.Enabled,
+		Schedule: codexinspection.ManagerCodexInspectionScheduleConfig{
+			Mode:            input.Schedule.Mode,
+			TimePoints:      append([]string(nil), input.Schedule.TimePoints...),
+			IntervalMinutes: input.Schedule.IntervalMinutes,
+			TimeZone:        input.Schedule.TimeZone,
+		},
+		TargetType:           input.TargetType,
+		Workers:              input.Workers,
+		DeleteWorkers:        input.DeleteWorkers,
+		Timeout:              input.Timeout,
+		Retries:              input.Retries,
+		UserAgent:            input.UserAgent,
+		UsedPercentThreshold: input.UsedPercentThreshold,
+		SampleSize:           input.SampleSize,
+		AutoActionMode:       input.AutoActionMode,
+	}
+}
+
 func (s *Server) serveManagementControlPanel(c *gin.Context) {
 	cfg := s.cfg
 	if cfg == nil || cfg.Home.Enabled || cfg.RemoteManagement.DisableControlPanel {
 		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+	if builtin := managementasset.BuiltinManagementHTML(); len(builtin) > 0 {
+		c.Header("Cache-Control", "no-store")
+		c.Data(http.StatusOK, "text/html; charset=utf-8", builtin)
 		return
 	}
 	filePath := managementasset.FilePath(s.configFilePath)

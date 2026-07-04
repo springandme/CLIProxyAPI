@@ -10,8 +10,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginstore"
@@ -127,6 +130,9 @@ type Config struct {
 
 	// Codex configures provider-wide Codex request behavior.
 	Codex CodexConfig `yaml:"codex" json:"codex"`
+
+	// CodexInspection configures Codex account inspection and scheduled account actions.
+	CodexInspection codexInspectionConfig `yaml:"codex-inspection" json:"codex-inspection"`
 
 	// CodexHeaderDefaults configures fallback headers for Codex OAuth model requests.
 	// These are used only when the client does not send its own headers.
@@ -280,6 +286,240 @@ type CodexHeaderDefaults struct {
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
 	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
+}
+
+// CodexInspectionScheduleConfig controls scheduled Codex account inspections.
+type CodexInspectionScheduleConfig struct {
+	Mode            string   `yaml:"mode,omitempty" json:"mode,omitempty"`
+	TimePoints      []string `yaml:"time-points,omitempty" json:"timePoints,omitempty"`
+	IntervalMinutes int      `yaml:"interval-minutes,omitempty" json:"intervalMinutes,omitempty"`
+	TimeZone        string   `yaml:"time-zone,omitempty" json:"timeZone,omitempty"`
+}
+
+// CodexInspectionConfig controls Codex account inspection behavior.
+type CodexInspectionConfig struct {
+	Enabled              *bool                         `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Schedule             CodexInspectionScheduleConfig `yaml:"schedule" json:"schedule"`
+	TargetType           string                        `yaml:"target-type,omitempty" json:"targetType,omitempty"`
+	Workers              int                           `yaml:"workers,omitempty" json:"workers,omitempty"`
+	DeleteWorkers        int                           `yaml:"delete-workers,omitempty" json:"deleteWorkers,omitempty"`
+	Timeout              int                           `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+	Retries              int                           `yaml:"retries,omitempty" json:"retries,omitempty"`
+	UserAgent            string                        `yaml:"user-agent,omitempty" json:"userAgent,omitempty"`
+	UsedPercentThreshold float64                       `yaml:"used-percent-threshold,omitempty" json:"usedPercentThreshold,omitempty"`
+	SampleSize           int                           `yaml:"sample-size,omitempty" json:"sampleSize,omitempty"`
+	AutoActionMode       string                        `yaml:"auto-action-mode,omitempty" json:"autoActionMode,omitempty"`
+}
+
+type codexInspectionConfig = CodexInspectionConfig
+
+const (
+	CodexInspectionScheduleModeInterval   = "interval"
+	CodexInspectionScheduleModeTimePoints = "time_points"
+
+	CodexInspectionAutoActionNone    = "none"
+	CodexInspectionAutoActionEnable  = "enable"
+	CodexInspectionAutoActionDisable = "disable"
+	CodexInspectionAutoActionDelete  = "delete"
+)
+
+func DefaultCodexInspectionConfig() CodexInspectionConfig {
+	enabled := false
+	return CodexInspectionConfig{
+		Enabled: &enabled,
+		Schedule: CodexInspectionScheduleConfig{
+			Mode:            CodexInspectionScheduleModeInterval,
+			IntervalMinutes: 60,
+		},
+		TargetType:           "codex",
+		Workers:              4,
+		DeleteWorkers:        4,
+		Timeout:              15000,
+		Retries:              0,
+		UserAgent:            "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
+		UsedPercentThreshold: 100,
+		SampleSize:           0,
+		AutoActionMode:       CodexInspectionAutoActionNone,
+	}
+}
+
+func NormalizeCodexInspectionConfig(input CodexInspectionConfig, fallback CodexInspectionConfig) CodexInspectionConfig {
+	base := fallback
+	if base.TargetType == "" {
+		base = DefaultCodexInspectionConfig()
+	}
+	next := base
+	if input.Enabled != nil {
+		enabled := *input.Enabled
+		next.Enabled = &enabled
+	}
+	next.Schedule = NormalizeCodexInspectionSchedule(input.Schedule, base.Schedule)
+	next.TargetType = valueOrLower(input.TargetType, base.TargetType)
+	next.Workers = positiveOr(input.Workers, base.Workers)
+	next.DeleteWorkers = positiveOr(input.DeleteWorkers, positiveOr(input.Workers, base.DeleteWorkers))
+	next.Timeout = positiveOr(input.Timeout, base.Timeout)
+	if input.Retries >= 0 {
+		next.Retries = input.Retries
+	}
+	next.UserAgent = valueOr(input.UserAgent, base.UserAgent)
+	next.UsedPercentThreshold = normalizePercent(input.UsedPercentThreshold, base.UsedPercentThreshold)
+	if input.SampleSize >= 0 {
+		next.SampleSize = input.SampleSize
+	}
+	next.AutoActionMode = NormalizeCodexInspectionAutoActionMode(input.AutoActionMode, base.AutoActionMode)
+	return next
+}
+
+func NormalizeCodexInspectionSchedule(input CodexInspectionScheduleConfig, fallback CodexInspectionScheduleConfig) CodexInspectionScheduleConfig {
+	base := fallback
+	if base.Mode == "" {
+		base = DefaultCodexInspectionConfig().Schedule
+	}
+	next := base
+
+	timePoints := NormalizeCodexInspectionTimePoints(input.TimePoints)
+	if len(timePoints) > 0 {
+		next.TimePoints = timePoints
+	}
+	if input.IntervalMinutes > 0 {
+		next.IntervalMinutes = input.IntervalMinutes
+	}
+	next.TimeZone = NormalizeCodexInspectionTimeZone(input.TimeZone, strings.TrimSpace(fallback.TimeZone))
+
+	switch strings.ToLower(strings.TrimSpace(input.Mode)) {
+	case CodexInspectionScheduleModeTimePoints:
+		next.Mode = CodexInspectionScheduleModeTimePoints
+	case CodexInspectionScheduleModeInterval:
+		next.Mode = CodexInspectionScheduleModeInterval
+	case "":
+		if len(timePoints) > 0 {
+			next.Mode = CodexInspectionScheduleModeTimePoints
+		} else if input.IntervalMinutes > 0 {
+			next.Mode = CodexInspectionScheduleModeInterval
+		}
+	}
+
+	if next.Mode == CodexInspectionScheduleModeTimePoints && len(next.TimePoints) == 0 {
+		next.Mode = CodexInspectionScheduleModeInterval
+	}
+	if next.Mode == CodexInspectionScheduleModeInterval && next.IntervalMinutes <= 0 {
+		next.IntervalMinutes = 60
+	}
+	return next
+}
+
+func NormalizeCodexInspectionTimeZone(value string, fallback string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return strings.TrimSpace(fallback)
+	}
+	if _, err := time.LoadLocation(trimmed); err != nil {
+		return strings.TrimSpace(fallback)
+	}
+	return trimmed
+}
+
+func ValidateCodexInspectionConfig(input CodexInspectionConfig) error {
+	return ValidateCodexInspectionTimeZone(input.Schedule.TimeZone)
+}
+
+func ValidateCodexInspectionTimeZone(value string) error {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return nil
+	}
+	if _, err := time.LoadLocation(trimmed); err != nil {
+		return fmt.Errorf("invalid time zone %q: %w", trimmed, err)
+	}
+	return nil
+}
+
+func NormalizeCodexInspectionTimePoints(values []string) []string {
+	seen := map[string]struct{}{}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		normalized, ok := normalizeCodexInspectionTimePoint(value)
+		if !ok {
+			continue
+		}
+		if _, exists := seen[normalized]; exists {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		result = append(result, normalized)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func normalizeCodexInspectionTimePoint(value string) (string, bool) {
+	parts := strings.Split(strings.TrimSpace(value), ":")
+	if len(parts) != 2 {
+		return "", false
+	}
+	hour, err := strconv.Atoi(parts[0])
+	if err != nil || hour < 0 || hour > 23 {
+		return "", false
+	}
+	minute, err := strconv.Atoi(parts[1])
+	if err != nil || minute < 0 || minute > 59 {
+		return "", false
+	}
+	return fmt.Sprintf("%02d:%02d", hour, minute), true
+}
+
+func NormalizeCodexInspectionAutoActionMode(value string, fallback string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case CodexInspectionAutoActionEnable:
+		return CodexInspectionAutoActionEnable
+	case CodexInspectionAutoActionDisable:
+		return CodexInspectionAutoActionDisable
+	case CodexInspectionAutoActionDelete:
+		return CodexInspectionAutoActionDelete
+	case CodexInspectionAutoActionNone:
+		return CodexInspectionAutoActionNone
+	default:
+		switch fallback {
+		case CodexInspectionAutoActionEnable, CodexInspectionAutoActionDisable, CodexInspectionAutoActionDelete:
+			return fallback
+		default:
+			return CodexInspectionAutoActionNone
+		}
+	}
+}
+
+func valueOr(value string, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return strings.TrimSpace(value)
+}
+
+func valueOrLower(value string, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func positiveOr(value int, fallback int) int {
+	if value > 0 {
+		return value
+	}
+	return fallback
+}
+
+func normalizePercent(value float64, fallback float64) float64 {
+	if value == 0 {
+		return fallback
+	}
+	if value > 0 && value <= 1 {
+		value *= 100
+	}
+	if value < 0 || value > 100 {
+		return fallback
+	}
+	return value
 }
 
 // TLSConfig holds HTTPS server settings.
@@ -727,6 +967,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
+	cfg.CodexInspection = DefaultCodexInspectionConfig()
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.
@@ -755,6 +996,10 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if cfg.RemoteManagement.PanelGitHubRepository == "" {
 		cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	}
+	if err := ValidateCodexInspectionConfig(cfg.CodexInspection); err != nil {
+		return nil, fmt.Errorf("invalid codex-inspection: %w", err)
+	}
+	cfg.CodexInspection = NormalizeCodexInspectionConfig(cfg.CodexInspection, DefaultCodexInspectionConfig())
 
 	cfg.Pprof.Addr = strings.TrimSpace(cfg.Pprof.Addr)
 	if cfg.Pprof.Addr == "" {

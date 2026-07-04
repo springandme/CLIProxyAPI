@@ -15,6 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/codexinspection"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginstore"
@@ -62,6 +63,7 @@ type Handler struct {
 	pluginStoreHTTPClient   pluginstore.HTTPDoer
 	pluginReleaseCacheMu    sync.Mutex
 	pluginReleaseCache      map[string]pluginReleaseCacheEntry
+	codexInspectionService  *codexinspection.Service
 }
 
 type configReloadSnapshot struct {
@@ -141,6 +143,45 @@ func (h *Handler) SetAuthManager(manager *coreauth.Manager) {
 	h.mu.Lock()
 	h.authManager = manager
 	h.mu.Unlock()
+}
+
+// AuthManager returns the current auth manager.
+func (h *Handler) AuthManager() *coreauth.Manager {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.authManager
+}
+
+// Config returns the current management config pointer.
+func (h *Handler) Config() *config.Config {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.cfg
+}
+
+// SetCodexInspectionService wires the Codex inspection service into management routes.
+func (h *Handler) SetCodexInspectionService(service *codexinspection.Service) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.codexInspectionService = service
+	h.mu.Unlock()
+}
+
+func (h *Handler) getCodexInspectionService() *codexinspection.Service {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.codexInspectionService
 }
 
 // SetPluginHost updates the plugin host used by plugin-backed management endpoints.

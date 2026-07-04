@@ -31,6 +31,7 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
+	cfg.CodexInspection = DefaultCodexInspectionConfig()
 
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config payload: %w", err)
@@ -49,6 +50,10 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	if cfg.RemoteManagement.PanelGitHubRepository == "" {
 		cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	}
+	if err := ValidateCodexInspectionConfig(cfg.CodexInspection); err != nil {
+		return nil, fmt.Errorf("invalid codex-inspection: %w", err)
+	}
+	cfg.CodexInspection = NormalizeCodexInspectionConfig(cfg.CodexInspection, DefaultCodexInspectionConfig())
 
 	cfg.Pprof.Addr = strings.TrimSpace(cfg.Pprof.Addr)
 	if cfg.Pprof.Addr == "" {
